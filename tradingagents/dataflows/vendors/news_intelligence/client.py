@@ -33,10 +33,11 @@ def map_ticker_for_news_intelligence(ticker: str) -> tuple[str, str]:
     - Foreign listings / exchange suffixes (700.HK -> 0700.HK)
 
     Returns:
-        tuple[str, str]: (query_symbol, resolved_annotation)
+        tuple[str, str]: (query_symbol, display_resolution_string)
     """
-    if not isinstance(ticker, str):
+    if not ticker or not isinstance(ticker, str):
         return "", ""
+
     raw = ticker.strip()
     compact = raw.upper().rstrip("+").replace("-", "")
 
@@ -57,7 +58,7 @@ def to_iso_utc(date_str: str, end_of_day: bool = False) -> str:
 
     Plain YYYY-MM-DD dates are expanded:
     - start of day (end_of_day=False): YYYY-MM-DDT00:00:00Z
-    - end of day (end_of_day=True): YYYY-MM-DDT23:59:59Z
+    - end of day (end_of_day=True): YYYY-MM-DDT23:59:59.999999Z (inclusive microsecond end)
     """
     if not date_str or not isinstance(date_str, str):
         return ""
@@ -67,22 +68,85 @@ def to_iso_utc(date_str: str, end_of_day: bool = False) -> str:
             return clean
         return f"{clean}Z"
     if end_of_day:
-        return f"{clean}T23:59:59Z"
+        return f"{clean}T23:59:59.999999Z"
     return f"{clean}T00:00:00Z"
 
 
 def parse_utc_timestamp(ts: str | None) -> datetime | None:
-    """Parse an ISO 8601 UTC timestamp string with up to microsecond precision."""
+    """Parse an ISO 8601 UTC timestamp string with up to microsecond precision.
+
+    Requires an explicit timezone indicator ('Z' or '+/-HH:MM'). Timezone-free timestamps are rejected.
+    """
     if not ts or not isinstance(ts, str):
         return None
     try:
-        clean = ts.strip().replace("Z", "+00:00")
+        clean = ts.strip()
+        # Verify explicit timezone before parsing; reject timezone-free strings
+        if not (clean.endswith("Z") or ("+" in clean[-6:] or "-" in clean[-6:])):
+            return None
         dt = datetime.fromisoformat(clean)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
+            return None
         return dt.astimezone(UTC)
     except Exception:
         return None
+
+
+def validate_canonical_event(event: dict[str, Any]) -> bool:
+    """Validate that an event conforms to the canonical MarketNewsEvent contract."""
+    if not isinstance(event, dict):
+        return False
+
+    # Mandatory identity/title/source fields
+    event_id = event.get("id")
+    if not isinstance(event_id, str) or not event_id.strip():
+        return False
+
+    source = event.get("source")
+    if not isinstance(source, str) or not source.strip():
+        return False
+
+    title = event.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return False
+
+    symbols = event.get("symbols")
+    if not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols):
+        return False
+
+    # Required publication and receipt timestamps with explicit timezone
+    pub_dt = parse_utc_timestamp(event.get("publishedAt"))
+    rec_dt = parse_utc_timestamp(event.get("receivedAt"))
+    if pub_dt is None or rec_dt is None:
+        return False
+
+    # EnrichedAt format if provided
+    enr_at_val = event.get("enrichedAt")
+    if enr_at_val is not None and (not isinstance(enr_at_val, str) or parse_utc_timestamp(enr_at_val) is None):
+        return False
+
+    # Sentiment validation if provided
+    sentiment = event.get("sentiment")
+    if sentiment is not None:
+        if not isinstance(sentiment, dict):
+            return False
+        score = sentiment.get("score")
+        if score is None or not isinstance(score, (int, float)) or not (-1.0 <= score <= 1.0):
+            return False
+        label = sentiment.get("label")
+        if label not in ("positive", "neutral", "negative"):
+            return False
+        confidence = sentiment.get("confidence")
+        if confidence is not None and (not isinstance(confidence, (int, float)) or not (0.0 <= confidence <= 1.0)):
+            return False
+
+    # Optional string fields
+    for field in ("summary", "clusterId", "url", "content"):
+        val = event.get(field)
+        if val is not None and not isinstance(val, str):
+            return False
+
+    return True
 
 
 def filter_and_sanitize_event(
@@ -94,7 +158,7 @@ def filter_and_sanitize_event(
     """Validate event and enforce bi-temporal point-in-time protections.
 
     Rules:
-    1. Mandatory fields: 'publishedAt' and 'receivedAt' must be valid UTC timestamps.
+    1. Mandatory fields: 'id', 'source', 'title', 'symbols', 'publishedAt', 'receivedAt'.
     2. Article Availability:
        - publishedAt <= cutoff AND receivedAt <= cutoff.
        - If publishedAt > cutoff: REJECT (future publication).
@@ -106,23 +170,18 @@ def filter_and_sanitize_event(
        - enrichedAt <= cutoff.
        - If enrichedAt is None or enrichedAt > cutoff:
          WITHHOLD all derived intelligence facts (sentiment, computed summary,
-         clusterId, enrichedAt) to eliminate future-enrichment leakage.
+         clusterId, enrichedAt, symbols -> []) to eliminate future-enrichment leakage.
 
     Returns:
         Sanitized event dict, or None if rejected.
     """
-    if not isinstance(event, dict):
+    if not validate_canonical_event(event):
         return None
 
-    pub_at_str = event.get("publishedAt")
-    rec_at_str = event.get("receivedAt")
+    pub_dt = parse_utc_timestamp(event["publishedAt"])
+    rec_dt = parse_utc_timestamp(event["receivedAt"])
 
-    pub_dt = parse_utc_timestamp(pub_at_str)
-    rec_dt = parse_utc_timestamp(rec_at_str)
-
-    if pub_dt is None or rec_dt is None:
-        logger.warning("Rejecting event with invalid timestamps: %r", event.get("id"))
-        return None
+    assert pub_dt is not None and rec_dt is not None
 
     # Bi-temporal availability check: both publication and receipt must be on or before cutoff
     if pub_dt > cutoff_dt:
@@ -143,14 +202,15 @@ def filter_and_sanitize_event(
 
     # Derived fact availability check:
     enr_at_str = event.get("enrichedAt")
-    enr_dt = parse_utc_timestamp(enr_at_str)
+    enr_dt = parse_utc_timestamp(enr_at_str) if enr_at_str else None
 
     if enr_dt is None or enr_dt > cutoff_dt:
-        # Withhold derived intelligence facts
+        # Withhold derived intelligence facts per canonical schema
         sanitized["sentiment"] = None
         sanitized["clusterId"] = None
         sanitized["summary"] = None
         sanitized["enrichedAt"] = None
+        sanitized["symbols"] = []
 
     return sanitized
 
@@ -163,29 +223,45 @@ def format_article(event: dict[str, Any]) -> str:
 
     sentiment = event.get("sentiment")
     if sentiment and isinstance(sentiment, dict):
-        label = sentiment.get("label")
         score = sentiment.get("score")
-        if label and score is not None:
-            out += f"Sentiment: {label} (score: {score:+.2f})\n"
-        elif label:
-            out += f"Sentiment: {label}\n"
-        elif score is not None:
-            out += f"Sentiment score: {score:+.2f}\n"
+        label = sentiment.get("label")
+        if score is not None and label is not None:
+            try:
+                f_score = float(score)
+                out += f"- Sentiment: {label} (score: {f_score:+.2f})\n"
+            except (ValueError, TypeError):
+                pass
 
-    # Prefer summary when available (and permitted by cutoff), else content
-    body = event.get("summary") or event.get("content") or ""
-    if body:
-        out += f"{body.strip()}\n"
+    pub_at = event.get("publishedAt")
+    if pub_at:
+        out += f"- Published: {pub_at}\n"
+
+    cluster_id = event.get("clusterId")
+    if cluster_id:
+        out += f"- Story Cluster: {cluster_id}\n"
 
     url = event.get("url")
     if url:
-        out += f"Link: {url}\n"
+        out += f"- URL: {url}\n"
 
-    return out
+    summary = event.get("summary")
+    if summary:
+        out += f"- Summary: {summary}\n"
+    elif event.get("content"):
+        # Fall back to content snippet if summary is not available
+        content_snippet = str(event["content"])[:300].replace("\n", " ").strip()
+        out += f"- Content: {content_snippet}...\n"
+
+    return out.strip()
 
 
 class NewsIntelligenceClient:
-    """Client for querying the News Intelligence platform REST API."""
+    """HTTP client for Repo 1 (trading-news-intelligence) REST endpoints.
+
+    Integrates:
+    - GET /api/v1/news?symbol={symbol}&asOf={cutoff}&from={start}&to={end}&limit={limit}
+    - GET /api/v1/news/global?asOf={cutoff}&from={start}&to={end}&limit={limit}
+    """
 
     def __init__(
         self,
@@ -193,10 +269,14 @@ class NewsIntelligenceClient:
         token: str | None = None,
         timeout: float | None = None,
         session: requests.Session | None = None,
-    ):
+    ) -> None:
         config = get_config()
-        raw_url = base_url or config.get("news_intelligence_url") or "http://localhost:3001"
-        clean_url = raw_url.strip().rstrip("/")
+        raw_url = base_url if base_url is not None else config.get("news_intelligence_url")
+        if not raw_url:
+            raise VendorNotConfiguredError("News Intelligence API URL is not configured")
+
+        # Strip trailing slash and trailing /api/v1 or /v1 path if supplied in base URL
+        clean_url = str(raw_url).rstrip("/")
         if clean_url.endswith("/api/v1"):
             clean_url = clean_url[:-len("/api/v1")]
         elif clean_url.endswith("/v1"):
@@ -228,12 +308,6 @@ class NewsIntelligenceClient:
         except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as exc:
             raise VendorUnavailableError(f"News Intelligence API connection error: {exc}") from exc
 
-        if resp.status_code == 404:
-            return {"events": [], "count": 0}
-
-        if resp.status_code >= 500:
-            raise VendorUnavailableError(f"News Intelligence API server error ({resp.status_code}): {resp.text}")
-
         if not resp.ok:
             raise VendorUnavailableError(f"News Intelligence API error ({resp.status_code}): {resp.text}")
 
@@ -241,9 +315,13 @@ class NewsIntelligenceClient:
             data = resp.json()
             if not isinstance(data, dict):
                 raise ValueError("Response is not a JSON object")
-            return data
         except Exception as exc:
             raise VendorUnavailableError(f"News Intelligence API invalid JSON: {exc}") from exc
+
+        if "events" not in data or not isinstance(data["events"], list):
+            raise VendorUnavailableError("News Intelligence API response missing or invalid 'events' list")
+
+        return data
 
     def get_news(self, ticker: str, start_date: str, end_date: str) -> str:
         """Fetch and format asset-specific news with bi-temporal point-in-time protections."""
@@ -281,7 +359,7 @@ class NewsIntelligenceClient:
                 min_pub_dt=min_pub_dt,
                 max_pub_dt=max_pub_dt,
             )
-            if ev is not None:
+            if ev is not None and query_symbol in ev.get("symbols", []):
                 sanitized_events.append(ev)
 
         if sanitized_events:

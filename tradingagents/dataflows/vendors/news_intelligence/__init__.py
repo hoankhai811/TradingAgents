@@ -13,6 +13,7 @@ from tradingagents.dataflows.vendors.news_intelligence.client import (
     map_ticker_for_news_intelligence,
     parse_utc_timestamp,
     to_iso_utc,
+    validate_canonical_event,
 )
 
 # Canonical aliases
@@ -30,4 +31,5 @@ __all__ = [
     "map_ticker_for_news_intelligence",
     "parse_utc_timestamp",
     "to_iso_utc",
+    "validate_canonical_event",
 ]
