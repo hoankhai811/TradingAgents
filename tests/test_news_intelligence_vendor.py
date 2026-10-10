@@ -22,7 +22,7 @@ import requests
 import tradingagents.dataflows.config as config_module
 import tradingagents.default_config as default_config
 from tradingagents.dataflows import router
-from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.config import run_config, set_config
 from tradingagents.dataflows.errors import VendorUnavailableError
 from tradingagents.dataflows.vendors.news_intelligence import (
     NewsIntelligenceClient,
@@ -653,3 +653,199 @@ class TestVendorRoutingIntegration:
             res = get_global_news_news_intelligence("2026-08-07", look_back_days=7, limit=10)
             assert res == "DIRECT_GLOBAL"
             mock_ggn.assert_called_once_with("2026-08-07", 7, 10)
+
+
+# =====================================================================
+# 8. Reviewer Round 2 Findings (R3a, R3b, R5)
+# =====================================================================
+
+
+@pytest.mark.unit
+class TestReviewerRound2Findings:
+    # --- R3a: Wholly schema-invalid nonempty feeds trigger fallback ---
+
+    @pytest.mark.parametrize("global_news", [False, True])
+    def test_invalid_nonempty_response_uses_configured_fallback(self, global_news):
+        """Reviewer proof: wholly invalid nonempty response triggers configured fallback."""
+        mock_resp = mock.Mock(status_code=200, ok=True)
+        mock_resp.json.return_value = {
+            "events": [canonical_event(sentiment={"score": 500, "label": "positive"})],
+            "count": 1,
+        }
+        mock_session = mock.Mock()
+        mock_session.get.return_value = mock_resp
+        vendor = NewsIntelligenceClient(base_url="http://test-server:3001", session=mock_session)
+
+        method = "get_global_news" if global_news else "get_news"
+        implementation = vendor.get_global_news if global_news else vendor.get_news
+        fallback = mock.Mock(return_value="VALID FALLBACK")
+        args = ("2026-08-05",) if global_news else ("AAPL", "2026-08-01", "2026-08-05")
+
+        with run_config({"data_vendors": {"news_data": "news_intelligence,yfinance"}}), mock.patch.dict(
+            router.VENDOR_METHODS[method],
+            {"news_intelligence": implementation, "yfinance": fallback},
+            clear=False,
+        ):
+            assert router.route_to_vendor(method, *args) == "VALID FALLBACK"
+        assert fallback.call_count == 1
+
+    def test_invalid_nonempty_response_single_vendor_returns_data_unavailable(self):
+        """With only news_intelligence configured, wholly invalid response yields DATA_UNAVAILABLE."""
+        mock_resp = mock.Mock(status_code=200, ok=True)
+        mock_resp.json.return_value = {
+            "events": [canonical_event(sentiment={"score": 500, "label": "positive"})],
+            "count": 1,
+        }
+        mock_session = mock.Mock()
+        mock_session.get.return_value = mock_resp
+        vendor = NewsIntelligenceClient(base_url="http://test-server:3001", session=mock_session)
+
+        with run_config({"data_vendors": {"news_data": "news_intelligence"}}), mock.patch.dict(
+            router.VENDOR_METHODS["get_news"],
+            {"news_intelligence": vendor.get_news},
+            clear=False,
+        ):
+            res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
+            assert res.startswith("DATA_UNAVAILABLE")
+            assert "no schema-valid events" in res
+
+    def test_valid_empty_response_does_not_trigger_fallback(self):
+        """Valid HTTP 200 with 0 events is a normal empty response, never triggering fallback."""
+        mock_resp = mock.Mock(status_code=200, ok=True)
+        mock_resp.json.return_value = {"events": [], "count": 0}
+        mock_session = mock.Mock()
+        mock_session.get.return_value = mock_resp
+        vendor = NewsIntelligenceClient(base_url="http://test-server:3001", session=mock_session)
+
+        fallback = mock.Mock(return_value="SHOULD NOT BE CALLED")
+        with run_config({"data_vendors": {"news_data": "news_intelligence,yfinance"}}), mock.patch.dict(
+            router.VENDOR_METHODS["get_news"],
+            {"news_intelligence": vendor.get_news, "yfinance": fallback},
+            clear=False,
+        ):
+            res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
+            assert "No news found for AAPL" in res
+        fallback.assert_not_called()
+
+    def test_valid_out_of_window_response_does_not_trigger_fallback(self):
+        """Valid events excluded only by timestamp window return normal empty message, not fallback."""
+        mock_resp = mock.Mock(status_code=200, ok=True)
+        mock_resp.json.return_value = {
+            "events": [
+                canonical_event(
+                    publishedAt="2026-07-20T10:00:00Z",
+                    receivedAt="2026-07-20T10:05:00Z",
+                )
+            ],
+            "count": 1,
+        }
+        mock_session = mock.Mock()
+        mock_session.get.return_value = mock_resp
+        vendor = NewsIntelligenceClient(base_url="http://test-server:3001", session=mock_session)
+
+        fallback = mock.Mock(return_value="SHOULD NOT BE CALLED")
+        with run_config({"data_vendors": {"news_data": "news_intelligence,yfinance"}}), mock.patch.dict(
+            router.VENDOR_METHODS["get_news"],
+            {"news_intelligence": vendor.get_news, "yfinance": fallback},
+            clear=False,
+        ):
+            res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
+            assert "No news found for AAPL" in res
+        fallback.assert_not_called()
+
+    def test_mixed_response_skips_invalid_row_with_warning(self, caplog):
+        """Mixed response includes valid events while logging warning and skipping invalid rows."""
+        mock_resp = mock.Mock(status_code=200, ok=True)
+        mock_resp.json.return_value = {
+            "events": [
+                canonical_event(id="bad-event", sentiment={"score": 500, "label": "positive"}),
+                canonical_event(id="good-event", title="Valid Tech Report", symbols=["AAPL"]),
+            ],
+            "count": 2,
+        }
+        mock_session = mock.Mock()
+        mock_session.get.return_value = mock_resp
+        vendor = NewsIntelligenceClient(base_url="http://test-server:3001", session=mock_session)
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            res = vendor.get_news("AAPL", "2026-08-01", "2026-08-05")
+
+        assert "Valid Tech Report" in res
+        assert any("bad-event" in msg for msg in caplog.messages)
+
+    # --- R3b: JSON boolean sentiment scores and confidence rejected ---
+
+    @pytest.mark.parametrize("score", [True, False])
+    def test_json_boolean_score_is_not_a_sentiment_number(self, score):
+        """Reviewer proof: boolean True/False scores must be rejected by validator and sanitizer."""
+        ev = canonical_event(sentiment={"score": score, "label": "positive"})
+        assert validate_canonical_event(ev) is False
+        assert filter_and_sanitize_event(ev, parse_utc_timestamp("2026-08-05T23:59:59Z")) is None
+
+    @pytest.mark.parametrize("confidence", [True, False])
+    def test_json_boolean_confidence_is_rejected(self, confidence):
+        """Boolean True/False confidence must be rejected by validator."""
+        ev = canonical_event(sentiment={"score": 0.5, "label": "positive", "confidence": confidence})
+        assert validate_canonical_event(ev) is False
+        assert filter_and_sanitize_event(ev, parse_utc_timestamp("2026-08-05T23:59:59Z")) is None
+
+    @pytest.mark.parametrize(
+        "score, expected_str",
+        [
+            (-1.0, "-1.00"),
+            (-1, "-1.00"),
+            (0.0, "+0.00"),
+            (0, "+0.00"),
+            (0.5, "+0.50"),
+            (1.0, "+1.00"),
+            (1, "+1.00"),
+        ],
+    )
+    def test_valid_numeric_sentiment_scores_accepted_and_formatted(self, score, expected_str):
+        """Valid numeric scores in [-1.0, 1.0] are accepted and formatted accurately."""
+        ev = canonical_event(sentiment={"score": score, "label": "positive"})
+        assert validate_canonical_event(ev) is True
+        formatted = format_article(ev)
+        assert f"(score: {expected_str})" in formatted
+
+    def test_format_article_guards_against_boolean_score_if_bypassed(self):
+        """format_article defensive check does not format boolean score as +1.00."""
+        ev = canonical_event(sentiment={"score": True, "label": "positive"})
+        formatted = format_article(ev)
+        assert "score: +1.00" not in formatted
+
+    # --- R5: Unsupported fractional timestamp precision rejected (>6 digits) ---
+
+    @pytest.mark.parametrize("fraction", ["1234567", "12345678", "123456789"])
+    def test_parse_utc_timestamp_rejects_more_than_six_fractional_digits(self, fraction):
+        """Timestamps with >6 fractional digits return None (rejected rather than truncated)."""
+        ts = f"2026-08-05T12:00:00.{fraction}Z"
+        assert parse_utc_timestamp(ts) is None
+
+    @pytest.mark.parametrize("fraction", ["1234567", "123456789"])
+    def test_unsupported_precision_never_moves_future_facts_before_cutoff(self, fraction):
+        """Reviewer proof: >6 fractional digits must not be silently truncated into earlier availability."""
+        future = f"2026-08-05T12:00:00.{fraction}Z"
+        row = canonical_event(publishedAt=future, receivedAt=future, enrichedAt=future)
+        assert filter_and_sanitize_event(row, parse_utc_timestamp("2026-08-05T12:00:00.123456Z")) is None
+
+    def test_unsupported_cutoff_precision_rejected(self):
+        """Unsupported cutoff timestamp precision (>6 digits) returns None from parse_utc_timestamp."""
+        cutoff_7 = "2026-08-05T12:00:00.1234567Z"
+        cutoff_dt = parse_utc_timestamp(cutoff_7)
+        assert cutoff_dt is None
+        assert filter_and_sanitize_event(canonical_event(), cutoff_dt) is None
+
+    def test_supported_six_digit_microsecond_precision_ordering(self):
+        """Supported 6-digit microsecond precision maintains strict point-in-time boundary ordering."""
+        event_pub = "2026-08-05T12:00:00.123456Z"
+        row = canonical_event(publishedAt=event_pub, receivedAt=event_pub)
+
+        cutoff_before = parse_utc_timestamp("2026-08-05T12:00:00.123455Z")
+        cutoff_exact = parse_utc_timestamp("2026-08-05T12:00:00.123456Z")
+        cutoff_after = parse_utc_timestamp("2026-08-05T12:00:00.123457Z")
+
+        assert filter_and_sanitize_event(row, cutoff_before) is None
+        assert filter_and_sanitize_event(row, cutoff_exact) is not None
+        assert filter_and_sanitize_event(row, cutoff_after) is not None

@@ -8,6 +8,7 @@ contract with strict bi-temporal point-in-time protections and ticker mapping.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -21,6 +22,11 @@ from tradingagents.dataflows.errors import (
 from tradingagents.dataflows.symbols import _CRYPTO_BASES, crypto_base, normalize_symbol
 
 logger = logging.getLogger(__name__)
+
+# Canonical ISO timestamp with explicit UTC or offset timezone; allows 1-6 fractional digits
+_ISO_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.([0-9]+))?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+)
 
 
 def map_ticker_for_news_intelligence(ticker: str) -> tuple[str, str]:
@@ -75,14 +81,19 @@ def to_iso_utc(date_str: str, end_of_day: bool = False) -> str:
 def parse_utc_timestamp(ts: str | None) -> datetime | None:
     """Parse an ISO 8601 UTC timestamp string with up to microsecond precision.
 
-    Requires an explicit timezone indicator ('Z' or '+/-HH:MM'). Timezone-free timestamps are rejected.
+    Requires an explicit timezone indicator ('Z' or '+/-HH:MM').
+    Rejects timezone-free timestamps and timestamps with fractional precision exceeding 6 digits.
     """
     if not ts or not isinstance(ts, str):
         return None
     try:
         clean = ts.strip()
-        # Verify explicit timezone before parsing; reject timezone-free strings
-        if not (clean.endswith("Z") or ("+" in clean[-6:] or "-" in clean[-6:])):
+        match = _ISO_TIMESTAMP_RE.match(clean)
+        if not match:
+            return None
+        frac = match.group(1)
+        if frac and len(frac) > 6:
+            # R5: reject unsupported fractional precision beyond 6 digits
             return None
         dt = datetime.fromisoformat(clean)
         if dt.tzinfo is None:
@@ -114,7 +125,7 @@ def validate_canonical_event(event: dict[str, Any]) -> bool:
     if not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols):
         return False
 
-    # Required publication and receipt timestamps with explicit timezone
+    # Required publication and receipt timestamps with explicit timezone and <=6 digit precision
     pub_dt = parse_utc_timestamp(event.get("publishedAt"))
     rec_dt = parse_utc_timestamp(event.get("receivedAt"))
     if pub_dt is None or rec_dt is None:
@@ -131,13 +142,23 @@ def validate_canonical_event(event: dict[str, Any]) -> bool:
         if not isinstance(sentiment, dict):
             return False
         score = sentiment.get("score")
-        if score is None or not isinstance(score, (int, float)) or not (-1.0 <= score <= 1.0):
+        # R3b: reject booleans explicitly (bool is a subclass of int in Python)
+        if (
+            score is None
+            or isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not (-1.0 <= score <= 1.0)
+        ):
             return False
         label = sentiment.get("label")
         if label not in ("positive", "neutral", "negative"):
             return False
         confidence = sentiment.get("confidence")
-        if confidence is not None and (not isinstance(confidence, (int, float)) or not (0.0 <= confidence <= 1.0)):
+        if confidence is not None and (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not (0.0 <= confidence <= 1.0)
+        ):
             return False
 
     # Optional string fields
@@ -151,7 +172,7 @@ def validate_canonical_event(event: dict[str, Any]) -> bool:
 
 def filter_and_sanitize_event(
     event: dict[str, Any],
-    cutoff_dt: datetime,
+    cutoff_dt: datetime | None,
     min_pub_dt: datetime | None = None,
     max_pub_dt: datetime | None = None,
 ) -> dict[str, Any] | None:
@@ -175,6 +196,9 @@ def filter_and_sanitize_event(
     Returns:
         Sanitized event dict, or None if rejected.
     """
+    if cutoff_dt is None or not isinstance(cutoff_dt, datetime):
+        return None
+
     if not validate_canonical_event(event):
         return None
 
@@ -225,7 +249,7 @@ def format_article(event: dict[str, Any]) -> str:
     if sentiment and isinstance(sentiment, dict):
         score = sentiment.get("score")
         label = sentiment.get("label")
-        if score is not None and label is not None:
+        if score is not None and not isinstance(score, bool) and label is not None:
             try:
                 f_score = float(score)
                 out += f"- Sentiment: {label} (score: {f_score:+.2f})\n"
@@ -340,6 +364,9 @@ class NewsIntelligenceClient:
         min_pub_dt = parse_utc_timestamp(min_pub)
         max_pub_dt = parse_utc_timestamp(max_pub)
 
+        if cutoff_dt is None:
+            raise VendorUnavailableError(f"Invalid or unsupported cutoff timestamp: {as_of}")
+
         params = {
             "symbol": query_symbol,
             "asOf": as_of,
@@ -351,8 +378,22 @@ class NewsIntelligenceClient:
         data = self._make_request("/api/v1/news", params)
         raw_events = data.get("events") or []
 
+        # R3a: if response is nonempty but contains 0 schema-valid events, raise error for fallback participation
+        if raw_events:
+            valid_events_count = sum(1 for e in raw_events if validate_canonical_event(e))
+            if valid_events_count == 0:
+                raise VendorUnavailableError(
+                    "News Intelligence API returned nonempty response with no schema-valid events"
+                )
+
         sanitized_events = []
         for raw_event in raw_events:
+            if not validate_canonical_event(raw_event):
+                logger.warning(
+                    "Skipping schema-invalid news event: %s",
+                    raw_event.get("id") if isinstance(raw_event, dict) else type(raw_event),
+                )
+                continue
             ev = filter_and_sanitize_event(
                 raw_event,
                 cutoff_dt=cutoff_dt,
@@ -393,6 +434,9 @@ class NewsIntelligenceClient:
         min_pub_dt = parse_utc_timestamp(min_pub)
         max_pub_dt = parse_utc_timestamp(max_pub)
 
+        if cutoff_dt is None:
+            raise VendorUnavailableError(f"Invalid or unsupported cutoff timestamp: {as_of}")
+
         params = {
             "asOf": as_of,
             "from": min_pub,
@@ -403,8 +447,22 @@ class NewsIntelligenceClient:
         data = self._make_request("/api/v1/news/global", params)
         raw_events = data.get("events") or []
 
+        # R3a: if response is nonempty but contains 0 schema-valid events, raise error for fallback participation
+        if raw_events:
+            valid_events_count = sum(1 for e in raw_events if validate_canonical_event(e))
+            if valid_events_count == 0:
+                raise VendorUnavailableError(
+                    "News Intelligence API returned nonempty response with no schema-valid events"
+                )
+
         sanitized_events = []
         for raw_event in raw_events:
+            if not validate_canonical_event(raw_event):
+                logger.warning(
+                    "Skipping schema-invalid news event: %s",
+                    raw_event.get("id") if isinstance(raw_event, dict) else type(raw_event),
+                )
+                continue
             ev = filter_and_sanitize_event(
                 raw_event,
                 cutoff_dt=cutoff_dt,
