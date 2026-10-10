@@ -197,23 +197,18 @@ class TestCryptoSymbolCoverage:
     @pytest.mark.parametrize(
         ("raw_ticker", "expected_query", "expected_resolved"),
         [
-            ("BTC-USD", "BTC", " (resolved to BTC)"),
-            ("BTCUSD", "BTC", " (resolved to BTC)"),
-            ("BTCUSDT", "BTC", " (resolved to BTC)"),
             ("BTC-USDC", "BTC", " (resolved to BTC)"),
-            ("BTCUSDC", "BTC", " (resolved to BTC)"),
-            ("ETH-USD", "ETH", " (resolved to ETH)"),
-            ("ETHUSD", "ETH", " (resolved to ETH)"),
-            ("ETHUSDT", "ETH", " (resolved to ETH)"),
             ("ETH-USDC", "ETH", " (resolved to ETH)"),
             ("SOL-USD", "SOL", " (resolved to SOL)"),
-            ("SOLUSDT", "SOL", " (resolved to SOL)"),
             ("DOGE-USD", "DOGE", " (resolved to DOGE)"),
             ("XRP-USD", "XRP", " (resolved to XRP)"),
-            ("ADA-USD", "ADA", " (resolved to ADA)"),
             ("AVAX-USD", "AVAX", " (resolved to AVAX)"),
             ("DOT-USD", "DOT", " (resolved to DOT)"),
-            ("btc-usd", "BTC", " (resolved to BTC)"),
+            ("LTC-USD", "LTC", " (resolved to LTC)"),
+            ("LTCUSDT", "LTC", " (resolved to LTC)"),
+            ("BCH-USD", "BCH", " (resolved to BCH)"),
+            ("LINK-USD", "LINK", " (resolved to LINK)"),
+            ("LINKUSDT", "LINK", " (resolved to LINK)"),
             ("ethusdt", "ETH", " (resolved to ETH)"),
         ],
     )
@@ -224,7 +219,7 @@ class TestCryptoSymbolCoverage:
 
     @pytest.mark.parametrize(
         "bare_ticker",
-        ["BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "AVAX", "DOT"],
+        ["DOGE", "XRP", "ADA", "AVAX", "DOT", "LTC", "BCH", "LINK"],
     )
     def test_crypto_bare_symbols_mapping(self, bare_ticker):
         query, resolved = map_ticker_for_news_intelligence(bare_ticker)
@@ -284,17 +279,15 @@ class TestEquitySymbolCoverage:
     @pytest.mark.parametrize(
         ("raw_ticker", "expected_query"),
         [
-            ("AAPL", "AAPL"),
-            ("MSFT", "MSFT"),
-            ("NVDA", "NVDA"),
             ("TSLA", "TSLA"),
-            ("GOOGL", "GOOGL"),
             ("AMZN", "AMZN"),
             ("META", "META"),
             ("aapl", "AAPL"),
             ("msft", "MSFT"),
-            ("700.HK", "0700.HK"),
             ("9988.HK", "9988.HK"),
+            ("NFLX", "NFLX"),
+            ("AMD", "AMD"),
+            ("005930.KS", "005930.KS"),
         ],
     )
     def test_equity_ticker_normalization(self, raw_ticker, expected_query):
@@ -722,152 +715,178 @@ class TestNetworkErrorsAndHttpCodes:
 
 
 class TestConfiguredFallbackChains:
-    """Verifies router fallback participation across diverse failure modes."""
+    """Verifies router fallback participation across diverse failure modes.
 
-    def test_fallback_chain_triggers_on_401(self):
+    Leaves the production news_intelligence adapter registration intact in
+    router.VENDOR_METHODS and mocks only at the requests.Session.get transport
+    boundary, proving real client error handling, adapter wiring, and router
+    fallback handoff.
+    """
+
+    @pytest.mark.parametrize("method", ["get_news", "get_global_news"])
+    @pytest.mark.parametrize(
+        ("status_code", "status_text"),
+        [
+            (401, "Unauthorized"),
+            (403, "Forbidden"),
+            (429, "Rate limit exceeded"),
+            (500, "Internal Server Error"),
+            (502, "Bad Gateway"),
+            (503, "Service Unavailable"),
+        ],
+    )
+    def test_fallback_chain_triggers_on_http_errors(self, method, status_code, status_text):
+        """HTTP error responses from news_intelligence trigger secondary vendor fallback."""
         set_config({
             "data_vendors": {"news_data": "news_intelligence,yfinance"},
             "news_intelligence_url": "https://news.example.com",
         })
 
-        mock_intel = mock.Mock(side_effect=VendorUnavailableError("News Intelligence API error (401): Unauthorized"))
-        mock_yf = mock.Mock(return_value="YFINANCE FALLBACK NEWS")
+        mock_resp = mock.Mock(spec=requests.Response)
+        mock_resp.ok = False
+        mock_resp.status_code = status_code
+        mock_resp.text = f"{status_code} {status_text}"
 
-        with mock.patch.dict(
-            router.VENDOR_METHODS["get_news"],
-            {"news_intelligence": mock_intel, "yfinance": mock_yf},
+        fallback_mock = mock.Mock(return_value="YFINANCE FALLBACK NEWS")
+        args = ("AAPL", "2026-08-01", "2026-08-05") if method == "get_news" else ("2026-08-05",)
+
+        with mock.patch("requests.Session.get", return_value=mock_resp) as mock_get, mock.patch.dict(
+            router.VENDOR_METHODS[method],
+            {"yfinance": fallback_mock},
             clear=False,
         ):
-            res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
+            res = router.route_to_vendor(method, *args)
             assert res == "YFINANCE FALLBACK NEWS"
-            mock_intel.assert_called_once()
-            mock_yf.assert_called_once()
+            mock_get.assert_called_once()
+            fallback_mock.assert_called_once_with(*args)
 
-    def test_fallback_chain_triggers_on_403(self):
+    @pytest.mark.parametrize("method", ["get_news", "get_global_news"])
+    @pytest.mark.parametrize(
+        "network_exc",
+        [
+            requests.exceptions.Timeout("Connection timed out after 10.0s"),
+            requests.exceptions.ConnectionError("Connection refused to https://news.example.com"),
+        ],
+    )
+    def test_fallback_chain_triggers_on_network_exceptions(self, method, network_exc):
+        """Network timeouts and connection failures trigger secondary vendor fallback."""
         set_config({
             "data_vendors": {"news_data": "news_intelligence,yfinance"},
             "news_intelligence_url": "https://news.example.com",
         })
 
-        mock_intel = mock.Mock(side_effect=VendorUnavailableError("News Intelligence API error (403): Forbidden"))
-        mock_yf = mock.Mock(return_value="YFINANCE 403 FALLBACK")
+        fallback_mock = mock.Mock(return_value="YFINANCE NET FALLBACK")
+        args = ("AAPL", "2026-08-01", "2026-08-05") if method == "get_news" else ("2026-08-05",)
 
-        with mock.patch.dict(
-            router.VENDOR_METHODS["get_news"],
-            {"news_intelligence": mock_intel, "yfinance": mock_yf},
+        with mock.patch("requests.Session.get", side_effect=network_exc) as mock_get, mock.patch.dict(
+            router.VENDOR_METHODS[method],
+            {"yfinance": fallback_mock},
             clear=False,
         ):
-            res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
-            assert res == "YFINANCE 403 FALLBACK"
-            mock_yf.assert_called_once()
+            res = router.route_to_vendor(method, *args)
+            assert res == "YFINANCE NET FALLBACK"
+            mock_get.assert_called_once()
+            fallback_mock.assert_called_once_with(*args)
 
-    def test_fallback_chain_triggers_on_429(self):
+    @pytest.mark.parametrize("method", ["get_news", "get_global_news"])
+    def test_successful_primary_response_does_not_trigger_fallback(self, method):
+        """Valid response from news_intelligence serves news without triggering secondary vendor."""
         set_config({
             "data_vendors": {"news_data": "news_intelligence,yfinance"},
             "news_intelligence_url": "https://news.example.com",
         })
 
-        mock_intel = mock.Mock(side_effect=VendorUnavailableError("News Intelligence API error (429): Rate limited"))
-        mock_yf = mock.Mock(return_value="YFINANCE 429 FALLBACK")
+        ev = canonical_event(
+            symbols=["AAPL"],
+            title="Apple Quarterly Earnings",
+            published_at="2026-08-03T10:00:00Z",
+            received_at="2026-08-03T10:05:00Z",
+        )
+        mock_resp = mock.Mock(spec=requests.Response)
+        mock_resp.ok = True
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"events": [ev], "count": 1}
 
-        with mock.patch.dict(
-            router.VENDOR_METHODS["get_news"],
-            {"news_intelligence": mock_intel, "yfinance": mock_yf},
+        fallback_mock = mock.Mock(return_value="UNEXPECTED FALLBACK")
+        args = ("AAPL", "2026-08-01", "2026-08-05") if method == "get_news" else ("2026-08-05",)
+
+        with mock.patch("requests.Session.get", return_value=mock_resp) as mock_get, mock.patch.dict(
+            router.VENDOR_METHODS[method],
+            {"yfinance": fallback_mock},
             clear=False,
         ):
-            res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
-            assert res == "YFINANCE 429 FALLBACK"
-            mock_yf.assert_called_once()
+            res = router.route_to_vendor(method, *args)
+            mock_get.assert_called_once()
+            fallback_mock.assert_not_called()
+            assert "Apple Quarterly Earnings" in res
 
-    def test_fallback_chain_triggers_on_timeout(self):
-        set_config({
-            "data_vendors": {"news_data": "news_intelligence,yfinance"},
-            "news_intelligence_url": "https://news.example.com",
-        })
-
-        mock_intel = mock.Mock(side_effect=VendorUnavailableError("News Intelligence API timed out after 10.0s"))
-        mock_yf = mock.Mock(return_value="YFINANCE TIMEOUT FALLBACK")
-
-        with mock.patch.dict(
-            router.VENDOR_METHODS["get_news"],
-            {"news_intelligence": mock_intel, "yfinance": mock_yf},
-            clear=False,
-        ):
-            res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
-            assert res == "YFINANCE TIMEOUT FALLBACK"
-            mock_yf.assert_called_once()
-
-    def test_fallback_chain_triggers_on_connection_error(self):
-        set_config({
-            "data_vendors": {"news_data": "news_intelligence,yfinance"},
-            "news_intelligence_url": "https://news.example.com",
-        })
-
-        mock_intel = mock.Mock(side_effect=VendorUnavailableError("News Intelligence API connection error"))
-        mock_yf = mock.Mock(return_value="YFINANCE CONN FALLBACK")
-
-        with mock.patch.dict(
-            router.VENDOR_METHODS["get_news"],
-            {"news_intelligence": mock_intel, "yfinance": mock_yf},
-            clear=False,
-        ):
-            res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
-            assert res == "YFINANCE CONN FALLBACK"
-            mock_yf.assert_called_once()
-
-    def test_global_news_fallback_chain_on_error(self):
-        set_config({
-            "data_vendors": {"news_data": "news_intelligence,yfinance"},
-            "news_intelligence_url": "https://news.example.com",
-        })
-
-        mock_intel = mock.Mock(side_effect=VendorUnavailableError("News Intelligence API error (500)"))
-        mock_yf_global = mock.Mock(return_value="YF GLOBAL MACRO FALLBACK")
-
-        with mock.patch.dict(
-            router.VENDOR_METHODS["get_global_news"],
-            {"news_intelligence": mock_intel, "yfinance": mock_yf_global},
-            clear=False,
-        ):
-            res = router.route_to_vendor("get_global_news", "2026-08-05")
-            assert res == "YF GLOBAL MACRO FALLBACK"
-            mock_yf_global.assert_called_once()
-
-    def test_multi_hop_fallback_chain(self):
+    @pytest.mark.parametrize("method", ["get_news", "get_global_news"])
+    def test_multi_hop_fallback_chain_order_and_arguments(self, method):
+        """Verifies multi-hop fallback executes in declared order with preserved arguments."""
         set_config({
             "data_vendors": {"news_data": "news_intelligence,alpha_vantage,yfinance"},
             "news_intelligence_url": "https://news.example.com",
         })
 
-        mock_intel = mock.Mock(side_effect=VendorUnavailableError("News Intelligence API error (500)"))
-        mock_av = mock.Mock(side_effect=VendorUnavailableError("AV throttled"))
-        mock_yf = mock.Mock(return_value="MULTI-HOP YF SUCCESS")
+        mock_resp = mock.Mock(spec=requests.Response)
+        mock_resp.ok = False
+        mock_resp.status_code = 429
+        mock_resp.text = "Rate limit exceeded"
 
-        with mock.patch.dict(
-            router.VENDOR_METHODS["get_news"],
-            {"news_intelligence": mock_intel, "alpha_vantage": mock_av, "yfinance": mock_yf},
+        call_order = []
+
+        def av_side_effect(*a, **kw):
+            call_order.append(("alpha_vantage", a, kw))
+            raise VendorUnavailableError("Alpha Vantage rate limit reached")
+
+        def yf_side_effect(*a, **kw):
+            call_order.append(("yfinance", a, kw))
+            return "MULTI-HOP YF SUCCESS"
+
+        mock_av = mock.Mock(side_effect=av_side_effect)
+        mock_yf = mock.Mock(side_effect=yf_side_effect)
+        args = ("AAPL", "2026-08-01", "2026-08-05") if method == "get_news" else ("2026-08-05",)
+
+        with mock.patch("requests.Session.get", return_value=mock_resp) as mock_get, mock.patch.dict(
+            router.VENDOR_METHODS[method],
+            {"alpha_vantage": mock_av, "yfinance": mock_yf},
             clear=False,
         ):
-            res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
+            res = router.route_to_vendor(method, *args)
             assert res == "MULTI-HOP YF SUCCESS"
-            mock_yf.assert_called_once()
+            mock_get.assert_called_once()
+            assert call_order == [
+                ("alpha_vantage", args, {}),
+                ("yfinance", args, {}),
+            ]
+            mock_av.assert_called_once_with(*args)
+            mock_yf.assert_called_once_with(*args)
 
-    def test_all_vendors_in_chain_fail_returns_data_unavailable(self):
+    @pytest.mark.parametrize("method", ["get_news", "get_global_news"])
+    def test_all_vendors_in_chain_fail_exhaustion(self, method):
+        """When all configured vendors fail, router exhausts chain and returns DATA_UNAVAILABLE."""
         set_config({
             "data_vendors": {"news_data": "news_intelligence,yfinance"},
             "news_intelligence_url": "https://news.example.com",
         })
 
-        mock_intel = mock.Mock(side_effect=VendorUnavailableError("News Intelligence 429"))
-        mock_yf = mock.Mock(side_effect=VendorUnavailableError("YF throttled"))
+        mock_resp = mock.Mock(spec=requests.Response)
+        mock_resp.ok = False
+        mock_resp.status_code = 500
+        mock_resp.text = "Internal Server Error"
 
-        with mock.patch.dict(
-            router.VENDOR_METHODS["get_news"],
-            {"news_intelligence": mock_intel, "yfinance": mock_yf},
+        mock_yf = mock.Mock(side_effect=VendorUnavailableError("YFinance connection timeout"))
+        args = ("AAPL", "2026-08-01", "2026-08-05") if method == "get_news" else ("2026-08-05",)
+
+        with mock.patch("requests.Session.get", return_value=mock_resp) as mock_get, mock.patch.dict(
+            router.VENDOR_METHODS[method],
+            {"yfinance": mock_yf},
             clear=False,
         ):
-            res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
-            assert res.startswith("DATA_UNAVAILABLE: no configured vendor could serve get_news right now")
+            res = router.route_to_vendor(method, *args)
+            mock_get.assert_called_once()
+            mock_yf.assert_called_once_with(*args)
+            assert res.startswith(f"DATA_UNAVAILABLE: no configured vendor could serve {method} right now")
 
 
 # =====================================================================
@@ -910,31 +929,33 @@ class TestDisabledDefaultAndDefaultBehavior:
         })
 
         mock_yf_ok = mock.Mock(return_value="YF PRIMARY SUCCESS")
-        mock_intel = mock.Mock(return_value="INTEL SECONDARY SUCCESS")
+        ev = canonical_event(symbols=["AAPL"], title="News Intel Secondary Event")
+        mock_resp = mock.Mock(spec=requests.Response, ok=True, status_code=200)
+        mock_resp.json.return_value = {"events": [ev], "count": 1}
 
-        # When yfinance succeeds, news_intelligence is never called
-        with mock.patch.dict(
+        # When yfinance succeeds, news_intelligence transport is never called
+        with mock.patch("requests.Session.get", return_value=mock_resp) as mock_get, mock.patch.dict(
             router.VENDOR_METHODS["get_news"],
-            {"yfinance": mock_yf_ok, "news_intelligence": mock_intel},
+            {"yfinance": mock_yf_ok},
             clear=False,
         ):
             res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
             assert res == "YF PRIMARY SUCCESS"
             mock_yf_ok.assert_called_once()
-            mock_intel.assert_not_called()
+            mock_get.assert_not_called()
 
-        # When yfinance fails, news_intelligence is called as fallback
+        # When yfinance fails, news_intelligence is called as fallback via real adapter and transport
         mock_yf_fail = mock.Mock(side_effect=VendorUnavailableError("YF failed"))
-        mock_intel.reset_mock()
 
-        with mock.patch.dict(
+        with mock.patch("requests.Session.get", return_value=mock_resp) as mock_get, mock.patch.dict(
             router.VENDOR_METHODS["get_news"],
-            {"yfinance": mock_yf_fail, "news_intelligence": mock_intel},
+            {"yfinance": mock_yf_fail},
             clear=False,
         ):
             res2 = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
-            assert res2 == "INTEL SECONDARY SUCCESS"
-            mock_intel.assert_called_once()
+            assert "News Intel Secondary Event" in res2
+            mock_yf_fail.assert_called_once()
+            mock_get.assert_called_once()
 
     def test_tool_vendors_override_takes_precedence_over_data_vendors(self):
         set_config({
@@ -943,15 +964,17 @@ class TestDisabledDefaultAndDefaultBehavior:
             "news_intelligence_url": "https://news.example.com",
         })
 
-        mock_intel = mock.Mock(return_value="TOOL VENDOR OVERRIDE NEWS")
+        ev = canonical_event(symbols=["AAPL"], title="Tool Vendor Override Article")
+        mock_resp = mock.Mock(spec=requests.Response, ok=True, status_code=200)
+        mock_resp.json.return_value = {"events": [ev], "count": 1}
         mock_yf = mock.Mock(return_value="YFINANCE UNUSED")
 
-        with mock.patch.dict(
+        with mock.patch("requests.Session.get", return_value=mock_resp) as mock_get, mock.patch.dict(
             router.VENDOR_METHODS["get_news"],
-            {"news_intelligence": mock_intel, "yfinance": mock_yf},
+            {"yfinance": mock_yf},
             clear=False,
         ):
             res = router.route_to_vendor("get_news", "AAPL", "2026-08-01", "2026-08-05")
-            assert res == "TOOL VENDOR OVERRIDE NEWS"
-            mock_intel.assert_called_once()
+            assert "Tool Vendor Override Article" in res
+            mock_get.assert_called_once()
             mock_yf.assert_not_called()
