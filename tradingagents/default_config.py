@@ -31,6 +31,9 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_GOOGLE_THINKING_LEVEL":   "google_thinking_level",
     "TRADINGAGENTS_OPENAI_REASONING_EFFORT": "openai_reasoning_effort",
     "TRADINGAGENTS_ANTHROPIC_EFFORT":        "anthropic_effort",
+    "TRADINGAGENTS_NEWS_INTELLIGENCE_URL":     "news_intelligence_url",
+    "TRADINGAGENTS_NEWS_INTELLIGENCE_TOKEN":   "news_intelligence_token",
+    "TRADINGAGENTS_NEWS_INTELLIGENCE_TIMEOUT": "news_intelligence_timeout",
 }
 
 
@@ -161,10 +164,14 @@ def build_default_config() -> dict:
             # Statements come from SEC EDGAR as filed (US filers), then Yahoo; the
         # overview and insider tools, which SEC EDGAR does not serve, from Yahoo.
         "fundamental_data": "sec_edgar,yfinance",  # Options: sec_edgar, alpha_vantage, yfinance
-            "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+            "news_data": "yfinance",             # Options: alpha_vantage, yfinance, news_intelligence
             "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
             "prediction_markets": "polymarket",  # Options: polymarket (keyless)
         },
+        # News Intelligence API settings (optional vendor)
+        "news_intelligence_url": os.getenv("TRADINGAGENTS_NEWS_INTELLIGENCE_URL") or "http://localhost:3001",
+        "news_intelligence_token": os.getenv("TRADINGAGENTS_NEWS_INTELLIGENCE_TOKEN") or None,
+        "news_intelligence_timeout": 10.0,
         # Tool-level configuration (takes precedence over category-level)
         "tool_vendors": {
             # Example: "get_stock_data": "alpha_vantage",  # Override category default
