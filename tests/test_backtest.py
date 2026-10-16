@@ -304,3 +304,111 @@ def test_a_ticker_or_date_given_twice_runs_and_settles_once(tmp_path):
     graph = _FakeGraph.instances[-1]
     assert graph.calls == [("NVDA", "2026-01-05")]
     assert graph.settled == ["NVDA"]
+
+
+@pytest.mark.unit
+def test_opt_in_provider_limit_stops_later_cells_and_settlements(tmp_path, monkeypatch):
+    class RateLimitError(Exception):
+        pass
+
+    calls = []
+
+    def propagate(self, ticker, trade_date, asset_type="stock", portfolio=None):
+        calls.append(ticker)
+        if ticker == "AAPL":
+            raise RateLimitError("quota exhausted")
+        self.memory_log.store_decision(ticker, trade_date, DECISION)
+
+    monkeypatch.setattr(_FakeGraph, "propagate", propagate)
+    result = run_backtest(
+        ["NVDA", "AAPL", "MSFT"],
+        ["2026-01-05"],
+        _config(tmp_path),
+        stop_on_provider_limit=True,
+        run_id="limited",
+    )
+    assert calls == ["NVDA", "AAPL"]
+    assert result.cells_run == 1 and result.skipped == 0 and len(result.failures) == 1
+    assert _FakeGraph.instances[-1].settled == []
+
+
+@pytest.mark.unit
+def test_opt_in_settlement_limit_stops_later_settlements(tmp_path, monkeypatch):
+    class ResourceExhausted(Exception):
+        pass
+
+    def settle(self, ticker):
+        self.settled.append(ticker)
+        raise ResourceExhausted("quota exhausted")
+
+    monkeypatch.setattr(_FakeGraph, "settle_pending", settle)
+    result = run_backtest(
+        ["NVDA", "AAPL"], ["2026-01-05"], _config(tmp_path), stop_on_provider_limit=True
+    )
+    assert _FakeGraph.instances[-1].settled == ["NVDA"]
+    assert result.cells_run == 2 and len(result.settlement_failures) == 1
+
+
+@pytest.mark.unit
+def test_opt_in_http_429_stops_but_ordinary_error_continues(tmp_path, monkeypatch):
+    from urllib.error import HTTPError
+
+    calls = []
+
+    def limited(self, ticker, trade_date, asset_type="stock", portfolio=None):
+        calls.append(ticker)
+        if ticker == "AAPL":
+            raise HTTPError("https://example.invalid/", 429, "private rate response", {}, None)
+        self.memory_log.store_decision(ticker, trade_date, DECISION)
+
+    monkeypatch.setattr(_FakeGraph, "propagate", limited)
+    result = run_backtest(
+        ["NVDA", "AAPL", "MSFT"],
+        ["2026-01-05"],
+        _config(tmp_path),
+        stop_on_provider_limit=True,
+        run_id="http-limited",
+    )
+    assert calls == ["NVDA", "AAPL"] and result.cells_run == 1
+
+    calls.clear()
+
+    def ordinary(self, ticker, trade_date, asset_type="stock", portfolio=None):
+        calls.append(ticker)
+        if ticker == "AAPL":
+            raise RuntimeError("ordinary vendor error")
+        self.memory_log.store_decision(ticker, trade_date, DECISION)
+
+    monkeypatch.setattr(_FakeGraph, "propagate", ordinary)
+    result = run_backtest(
+        ["NVDA", "AAPL", "MSFT"],
+        ["2026-01-05"],
+        _config(tmp_path),
+        stop_on_provider_limit=True,
+        run_id="ordinary",
+    )
+    assert calls == ["NVDA", "AAPL", "MSFT"] and result.cells_run == 2
+
+
+@pytest.mark.unit
+def test_provider_limit_classifier_uses_numeric_response_or_class_not_message():
+    from http import HTTPStatus
+    from urllib.error import HTTPError
+
+    from tradingagents.llm_clients.errors import is_provider_limit_error
+
+    class Response:
+        status_code = HTTPStatus.TOO_MANY_REQUESTS
+
+    class WrappedHTTPError(Exception):
+        response = Response()
+
+    assert is_provider_limit_error(WrappedHTTPError("opaque"))
+    assert is_provider_limit_error(
+        HTTPError("https://example.invalid/", 429, "private response", {}, None)
+    )
+    class BooleanStatus(Exception):
+        status = True
+
+    assert not is_provider_limit_error(BooleanStatus("429"))
+    assert not is_provider_limit_error(RuntimeError("RateLimitError 429 ResourceExhausted"))

@@ -26,6 +26,7 @@ from tradingagents.agents.rating import RATING_REVIEW
 from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.llm_clients.errors import is_provider_limit_error
 from tradingagents.memory import TradingMemoryLog
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,7 @@ def run_backtest(
     selected_analysts=("market", "social", "news", "fundamentals"),
     run_id: str | None = None,
     progress: Callable[[int, int, str, str], None] | None = None,
+    stop_on_provider_limit: bool = False,
 ) -> BacktestResult:
     """Analyze every ticker on every date, into a memory log of this run's own.
 
@@ -167,8 +169,10 @@ def run_backtest(
             graph.propagate(ticker, date, asset_type, portfolio=portfolio)
             result.cells_run += 1
         except Exception as exc:  # one unreachable vendor must not end the sweep
-            logger.warning("Backtest cell %s %s failed: %s", ticker, date, exc)
+            logger.warning("Backtest cell %s %s failed", ticker, date)
             result.failures.append((ticker, date, str(exc)))
+            if stop_on_provider_limit and is_provider_limit_error(exc):
+                return result
 
     # Settlement runs at the start of the next run for a ticker, so each ticker's
     # last cell would stay pending without this pass.
@@ -176,8 +180,10 @@ def run_backtest(
         try:
             graph.settle_pending(ticker)
         except Exception as exc:  # reflection calls an LLM; one failure is not the sweep's
-            logger.warning("Settling %s failed: %s", ticker, exc)
+            logger.warning("Settling %s failed", ticker)
             result.settlement_failures.append((ticker, str(exc)))
+            if stop_on_provider_limit and is_provider_limit_error(exc):
+                break
     return result
 
 
