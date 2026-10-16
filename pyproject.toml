@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "jsonschema[format-nongpl]>=4.26",
     "ruff>=0.16",
     "pytest>=8.0",
     "pytest-subtests>=0.13",

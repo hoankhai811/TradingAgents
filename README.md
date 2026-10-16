@@ -328,6 +328,10 @@ An empty `positions` list means a flat book, which is different from passing not
 
 ## Persistence and Recovery
 
+For a local dashboard integration, start the [durable thin service](docs/thin-service.md)
+and use its analysis, backtest, status, and report routes. It runs the same native
+engine through one bounded worker process at a time.
+
 TradingAgents persists two kinds of state across runs.
 
 ### Memory log
