@@ -149,3 +149,150 @@ uv run python -m experiments.t13_native_ab settle --manifest <path/to/manifest.j
 # 4. Summarize matched pairs and performance metrics (offline/no network):
 uv run python -m experiments.t13_native_ab summarize --output <path/to/output_dir>
 ```
+
+## 10. Prospective Evidence Capture Protocol (Revision 6.0.0)
+
+The prospective observation and diagnostic capture system (`ProspectiveCaptureContext`, `_verify_v2_archive`, `validate_evidence_archive`) provides verifiable, tamper-evident recording of live API interactions during decision generation without retrospective backfilling or external truth claims.
+
+### Two-Tier Storage Layout
+1. **Discrete Per-Call Raw Snapshots**:
+   - Location: `cells/{cell_key}/data/responses/{seq:03d}_{tool}_{call_id}.json`
+   - Content: Exact, unmodified vendor API response payload (raw JSON list/dict as returned across the transport boundary).
+   - Atomic Persistence: Writes to temporary file, flushes file buffer, calls `os.fsync(fileno)`, renames via `os.replace`, and verifies the written snapshot digest matches the in-memory payload SHA-256 hash before completing the call.
+2. **Cumulative Archive Envelopes (`t13-archive/v2`)**:
+   - Location: `cells/{cell_key}/data/baseline_archive.json` (Arm A) and `provenance_archive.json` (Arm B).
+   - Schema:
+     - `version`: Strictly `"t13-archive/v2"`
+     - `attempt_id`: Monotonically bound to the decision attempt UUID
+     - `ticker`: Target asset symbol
+     - `arm`: `"A"` or `"B"`
+     - `date`: Execution civil trade date
+     - `vendor`: `"yfinance"` (Arm A) or `"news_intelligence"` (Arm B)
+     - `created_at`: UTC ISO timestamp
+     - `calls`: Chronological array of discrete tool execution records, capturing:
+       - `call_seq`: Monotonic integer sequence (1, 2, ...)
+       - `call_id`: Unique UUID4 string
+       - `tool`: Invoked tool name (`get_news` or `get_global_news`)
+       - `run_id`: LangChain callback run identifier
+       - `query`: Request query target
+       - `received_at`: Local machine receipt timestamp in UTC ISO format
+       - `params`: Exact dictionary of bound request arguments
+       - `snapshot_path`: Relative path to discrete snapshot file
+       - `raw_payload_hash`: SHA-256 digest of raw payload
+       - `records`: List of normalized articles (Arm A) or sanitized events (Arm B)
+       - `output_hash`: SHA-256 digest of the producer formatted text output
+     - `articles` / `events`: Cumulative collection of normalized/sanitized records.
+
+### Concurrency & Process Safety
+- **In-Process Mutex**: An internal `threading.RLock()` in `ProspectiveCaptureContext` guards sequence allocation, raw snapshot write, envelope update, fsync, and read-back verification, ensuring thread-safe execution under parallel LangChain agents and tool calls.
+- **Process Owner Lock**: Mutating commands (`run`, `settle`) continue to acquire the exclusive `.experiment-owner` file lock beside the output directory, preventing concurrent processes from interleaving operations on the same cell directory.
+
+### Fail-Closed Storage Failures
+- Any snapshot or envelope write, flush, fsync, or read-back verification failure immediately raises `EvidenceStorageError`.
+- `run_experiment` catches `EvidenceStorageError`, marks the cell `phase: "failed"` with `status: "FAILED_INCOMPLETE"`, updates `journal.json` with durable sync, and aborts the cell without automated paid replay.
+
+### Unbroken 5-Step Derivation Chain (`_verify_v2_archive`)
+Archive envelopes declaring `version: "t13-archive/v2"` are validated against observed tool outputs in `audit_trace.json` through a strict 5-step derivation chain:
+1. **Bounded Snapshot Read & SHA-256 Verification**: Reads each `snapshot_path` from disk, computes its SHA-256 digest, and enforces byte-level equality with `raw_payload_hash`.
+2. **Native Normalization & Point-in-Time Sanitization**:
+   - **Arm A**: Applies native `yahoo_news._extract_article_data`, filters within window via `date_window.in_window`, and truncates to configured limits.
+   - **Arm B**: Validates canonical events via `validate_canonical_event` and applies point-in-time filtering via `ni_client.filter_and_sanitize_event` at the verified entry cutoff.
+3. **Arm-Specific Field-by-Field Record Equality**:
+   - **Arm A**: Compares `title`, `summary`, `publisher`, `link`, and `pub_date` between stored records and derived snapshot records without fabricating artificial fields.
+   - **Arm B**: Compares canonical fields `id`, `publishedAt`, `receivedAt`, `enrichedAt`, and `symbols`.
+4. **Complete Native Producer Output Reconstruction**:
+   - Reconstructs exact producer strings including headers (`## {ticker} News, from {start} to {end}:`), window formatting, limit truncation, empty window sentinels (`No news found...`), and coverage gap warnings (`<Yahoo Finance news unavailable...>`).
+5. **Exact Hash and Text Comparison**:
+   - Enforces exact match between candidate output hash and observed `output_hash` in `audit_trace.json`.
+   - Binds tool completions to corresponding tool starts using `run_id`.
+   - Fails closed immediately on any discrepancy.
+
+### Version Fail-Closed Dispatch Policy
+Envelopes declaring `version: "t13-archive/v2"` are routed exclusively to `_verify_v2_archive`. If any step fails, verification returns `(False, reason)` immediately. The validator strictly forbids silent fallback to legacy candidate matching or heuristic searches.
+
+### Summary Contract & Diagnostic Accounting
+In accordance with the unresolved first-close availability status of historical and prospective feeds:
+- `strict_empirical_eligible` is strictly `False`.
+- `availability_status` is strictly `"availability_unknown"`.
+- `scored_pairs_count` is strictly `0`.
+- `settled_pairs_count` is strictly `0`.
+- `provenance_verified` is strictly `False`.
+- `timing_eligible` is strictly `False`.
+- Simulated alpha metrics are strictly isolated within the `diagnostic_summary` object with `diagnostic_status = "NON_EMPIRICAL_DIAGNOSTIC_ONLY"`, ensuring zero false empirical claims in public summaries.
+
+### Round 2 Hardened Verification & Concurrency Protocol (Findings R1 - R7)
+1. **Unconditional Diagnostic Public Contract (R1)**:
+   - The public summary fields (`scored_pairs_count = 0`, `settled_pairs_count = 0`, `strict_empirical_eligible = False`, `availability_status = "availability_unknown"`, `provenance_verified = False`, `timing_eligible = False`, `ineligible_pairs_count = planned_pairs_count`, `mean_alpha_* = None`, `directional_hits_* = 0`, `directional_hit_rate_* = None`) are unconditionally enforced across Version 2, legacy, unknown version, absent archive, malformed archive, and recovered states.
+   - Per-pair public flags (`provenance_verified`, `timing_eligible`, `eligible`) remain strictly `False`, while internal verification metrics are cleanly routed to `diagnostic_summary` and diagnostic flags (`diagnostic_provenance_verified`, `diagnostic_timing_eligible`, `diagnostic_eligible`).
+2. **Context-Wide Capture Hooks with Thread-Local Isolation (R2)**:
+   - Capture hooks on Yahoo and News Intelligence are installed once per `ProspectiveCaptureContext.__enter__` across all worker threads.
+   - Pending calls and collected responses use thread-local state (`threading.local()`), preventing cross-contamination or article bleeding across parallel tool invocations.
+   - `__exit__` cleanly restores original methods across all error and exit paths.
+3. **1-to-1 Cardinality & Run ID Bijection (R3)**:
+   - Enforces exact cardinality: the number of archive calls must equal the number of observed news tool completions in `audit_trace.json` (`len(calls) == len(news_ends)`).
+   - Binds each call to a tool execution by exact `run_id` without positional fallback. Duplicate `run_id` bindings, unarchived tool ends, or missing tool starts fail closed immediately.
+   - Validates that requested tickers, query parameters, declared output hashes, and derived candidate hashes match observed trace events.
+4. **Immediate Post-Return Receipt Clock & Entry Cutoff Enforcement (R4)**:
+   - `received_at` is timestamped immediately after the vendor HTTP request returns.
+   - If wall clock advances past the entry cutoff during transport, `received_at > dt_cutoff` triggers immediate verification failure.
+   - Events with publication, receipt, or enrichment timestamps after the cutoff fail point-in-time sanitization.
+5. **Producer Parameter Retention & Yahoo Search Sentinel (R5)**:
+   - Retains original producer arguments (`producer_params`) alongside transport HTTP parameters, guaranteeing that non-default query windows round-trip cleanly without default fallback.
+   - Reconstructs authentic native sentinels when Yahoo feeds are empty and search fallback is activated (`feed_source == "search"`).
+6. **Snapshot Path Containment & Resource Bounds (R6)**:
+   - Snapshot candidate search enforces strict containment within the cell directory (`snap_path.is_relative_to(cell_dir.resolve())`).
+   - Rejects absolute paths, path traversal (`..`), symlinks, and non-regular files.
+   - Enforces collection and snapshot limits: `MAX_SNAPSHOT_BYTES = 10 * 1024 * 1024`, `MAX_ARCHIVE_CALLS = 100`, `MAX_CALL_RECORDS = 500`.
+7. **Full Envelope Read-Back Equality Verification (R7)**:
+   - After atomic replace, the written archive envelope is fully parsed and checked for deep object equality (`read_obj == envelope`).
+   - Any corruption or silent mutation in nested fields raises `EvidenceStorageError` and halts the cell.
+
+### Round 3 Strict Request Binding & Defensive Bounds Protocol (Findings HIGH1, MED2, MED3, MED4)
+1. **Full Effective Request Argument Binding & Unique Tool Starts (HIGH1)**:
+   - Enforces exact 1-to-1 bijection for both starts and ends: `len(calls) == len(news_starts)` and `len(calls) == len(news_ends)`.
+   - Rejects duplicate `tool_start` traces with the same `run_id`.
+   - Requires `tool_start` trace input to be valid JSON dictionary; rejects null, empty, malformed, or non-dictionary types (e.g. lists/scalars).
+   - Binds and validates all effective request parameters (`ticker`, `start_date`, `end_date`, `as_of_date`, `look_back_days`, `limit`) between observed tool start inputs and captured call/producer parameters, normalizing legitimate defaults.
+2. **Explicit Zero Limit Preservation (MED2)**:
+   - Resolves effective limits across Arm A and Arm B using explicit `is not None` checks instead of truthy `or` chaining (`val is not None`).
+   - Distinguishes explicit `limit=0` from omitted/None limits, reproducing exact native sentinels (Yahoo unavailable sentinel, News Intelligence header-only) without fallback substitution.
+3. **Fail-Closed Shape Validation for Nested Archive Fields (MED3)**:
+   - Validates nested shapes before dereferencing: `prod_p` dict, `params` dict, `records` list of dicts with scalar timestamps within cutoff.
+   - Validates snapshot payloads: Arm A must be a list of dicts, Arm B must be a dict with `events` list of dicts.
+   - Fails closed locally returning `(False, reason)` without raising uncaught exceptions, preventing invalid envelopes (`records: [null]`, scalar records, malformed parameters) from crashing `summarize_experiment`.
+4. **Pre-Allocation Envelope Read Bounds (MED4)**:
+   - Defines and documents `MAX_ENVELOPE_BYTES = 4 * 1024 * 1024` (4 MiB) for outer archive envelopes.
+   - Implements `_read_bounded_json_envelope(fpath: Path) -> tuple[Any | None, str | None]` using bounded reads before `json.loads` or memory allocation.
+   - Applied at all archive input boundaries (`_verify_archive_for_arm`, `_verify_timing_clock_file`, and version scanning in `_evaluate_arm_evidence`), preventing memory exhaustion from oversized or padded envelopes while keeping the 10 MiB snapshot bound separate.
+
+### Round 4 Native Callback Extraction, Effective Binding & Bounded Read Protocol (Findings HIGH1, HIGH2, MED3)
+1. **LangGraph ToolNode Native Message Extraction & Injected State Binding (HIGH1)**:
+   - ToolNode passes `ToolMessage` instances into `AuditCallbackHandler.on_tool_end`. The handler extracts `output.content` when available rather than stringifying the container `ToolMessage` (which contains object metadata, tool call IDs, and names), guaranteeing that the tool output string and its SHA-256 hash match the authentic consumed tool return.
+   - Parses both strict JSON strings and Python mapping string literals (`ast.literal_eval`) emitted by LangGraph tool execution, rejecting scalars, lists, empty strings, and malformed structures without permissive regex fallback.
+   - Binds model-omitted tickers from trusted cell state (`company_of_interest`) because native LangGraph tools inject the symbol via `InjectedState("company_of_interest")`, while verifying that if a model explicitly supplies a ticker, it matches the cell ticker.
+   - Evaluates requested date windows through native `as_of_window` and `as_of` clamping before comparing against producer parameters, ensuring that forward dates clamped to the execution `trade_date` are correctly verified rather than falsely rejected.
+2. **Mandatory Model Arguments & Cross-Transport Metadata Consistency (HIGH2)**:
+   - Enforces visible mandatory arguments: `start_date` and `end_date` are strictly required for `get_news`; `curr_date` (or `as_of_date`/`date`/`asOf`) is strictly required for `get_global_news`. Omission triggers immediate fail-closed verification failure.
+   - Enforces cross-transport metadata consistency across all parameters: observed model arguments, producer parameters, and transport parameters (`symbol`, `ticker`, `asOf`, `from`, `to`, `start_date`, `end_date`, `limit`) must agree. Any contradiction (such as transport `symbol` mutating the requested asset or transport `to` extending the date range) triggers verification failure.
+3. **Guaranteed Bounded Allocation via MAX + 1 Stream Reading (MED3)**:
+   - Defines `MAX_ENVELOPE_BYTES = 4 * 1024 * 1024` (4 MiB) and `MAX_SNAPSHOT_BYTES = 10 * 1024 * 1024` (10 MiB).
+   - Replaces naive `read_bytes()` after `stat()` with `_read_bounded_bytes(fpath, max_bytes) -> tuple[bytes | None, str | None]`, which reads at most `max_bytes + 1` bytes via stream `f.read(max_bytes + 1)` and checks `len(data) <= max_bytes` before decoding or parsing.
+   - Binds memory allocation even in the presence of race growth or file replacement occurring after the initial `stat()` check, applied across outer JSON envelopes, raw snapshot validation, and read-back equality checks.
+
+### Round 5 Transport Clock Exact UTC Instant Verification Protocol (Finding 1)
+1. **Full Expected Transport Instant Derivation via Native `to_iso_utc` Contract**:
+   - Derives full expected transport instants using the native News Intelligence `to_iso_utc` contract:
+     - Start-of-day for `from` (`YYYY-MM-DDT00:00:00Z`).
+     - End-of-day for `to` and `asOf` (`YYYY-MM-DDT23:59:59.999999Z` inclusive microsecond end).
+2. **Exact Instant Comparison & Same-Date Mutation Rejection**:
+   - Eliminates the previous permissive same-calendar-date fallback (`str(value)[:10] != eff_date`).
+   - Parses transport timestamps via `_parse_utc_iso` into canonical `datetime.astimezone(UTC)` objects and compares complete UTC instants against expected values.
+   - Fails closed immediately if any transport timestamp is missing, malformed (e.g. `2026-08-03-not-a-timestamp`), timezone-unaware, or mutated to a different time on the same date (e.g. `23:59:59.999999Z` changed to `10:00:00Z`, `00:00:00Z` changed to `23:00:00Z`).
+   - Supports legitimate UTC-equivalent timestamp representations (e.g., `+00:00` offset notation matching `Z`) while preserving civil-date comparisons for Arm A (Yahoo) and producer date arguments.
+
+### Round 6 Mandatory Arm B Transport Clocks & Deletion Rejection Protocol (Finding 1)
+1. **Unconditional Requirement for Native Transport Clocks**:
+   - For all Arm B news calls (both asset-level `get_news` and macro `get_global_news`), all three native transport clock keys (`asOf`, `from`, `to`) are strictly mandatory in `params`.
+   - Before instant parsing or comparison, `_verify_v2_archive` unconditionally checks for the presence and non-nullity of each key. If any of `asOf`, `from`, or `to` is omitted, deleted, or `None`, verification fails closed immediately with:
+     `"Archive v2 verification failure: transport missing required parameter '<field>'"`
+   - Eliminates the bypass vulnerability where omitting or deleting a transport clock parameter from `params` evaded instant comparison entirely.
