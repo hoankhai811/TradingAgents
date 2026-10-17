@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from dateutil.relativedelta import relativedelta
 from langchain_core.callbacks import BaseCallbackHandler
 
 from tradingagents.agents.rating import RATING_REVIEW
@@ -89,6 +91,10 @@ class ManifestMismatchError(ValueError):
     """Raised when the active manifest hash does not match the journal."""
 
 
+class EvidenceStorageError(RuntimeError):
+    """Raised when prospective evidence capture fails to persist snapshot or envelope."""
+
+
 # ---------------------------------------------------------------------------
 # Secret Scrubbing & Sanitization
 # ---------------------------------------------------------------------------
@@ -115,6 +121,9 @@ def sanitize_text(text: Any) -> str:
 # ---------------------------------------------------------------------------
 # Callback for Request Accounting & Tool/Model Trace Auditing (R6)
 # ---------------------------------------------------------------------------
+
+_current_tool_run_id = threading.local()
+_thread_capture_state = threading.local()
 
 
 class AuditCallbackHandler(BaseCallbackHandler):
@@ -323,6 +332,7 @@ class AuditCallbackHandler(BaseCallbackHandler):
         clean_input = sanitize_text(input_str)
         inp_hash = hashlib.sha256(input_str.encode("utf-8")).hexdigest()
         run_id = str(kwargs.get("run_id") or "")
+        _current_tool_run_id.value = run_id or None
         call_rec = {
             "name": tool_name,
             "input": input_str,
@@ -345,8 +355,14 @@ class AuditCallbackHandler(BaseCallbackHandler):
             }
         )
 
-    def on_tool_end(self, output: str, **kwargs: Any) -> None:
-        out_str = str(output)
+    def on_tool_end(self, output: Any, **kwargs: Any) -> None:
+        _current_tool_run_id.value = None
+        if hasattr(output, "content"):
+            out_str = str(output.content)
+        elif isinstance(output, dict) and "content" in output:
+            out_str = str(output["content"])
+        else:
+            out_str = str(output)
         clean_out = sanitize_text(out_str)
         out_hash = hashlib.sha256(out_str.encode("utf-8")).hexdigest()
         run_id = str(kwargs.get("run_id") or "")
@@ -380,6 +396,7 @@ class AuditCallbackHandler(BaseCallbackHandler):
         )
 
     def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
+        _current_tool_run_id.value = None
         run_id = str(kwargs.get("run_id") or "")
         if run_id and run_id in self._pending_tool_calls_by_run_id:
             pending = self._pending_tool_calls_by_run_id.pop(run_id)
@@ -766,6 +783,673 @@ def _is_fatal_provider_error(exc_or_reason: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Prospective Evidence Capture Context & Native Hooks (TIP-14 Revision 5)
+# ---------------------------------------------------------------------------
+
+MAX_ENVELOPE_BYTES: int = 4 * 1024 * 1024  # 4 MiB finite bound on archive envelope size
+MAX_SNAPSHOT_BYTES: int = 10 * 1024 * 1024  # 10 MB limit on raw snapshot size
+
+
+def _read_bounded_bytes(fpath: Path, max_bytes: int) -> tuple[bytes | None, str | None]:
+    """Read at most max_bytes + 1 from fpath and verify returned bytes <= max_bytes.
+
+    Prevents unbounded allocation even if file grows or is replaced after stat (MED3).
+    """
+    if not fpath.exists():
+        return None, f"File does not exist: {fpath}"
+    if not fpath.is_file():
+        return None, f"Path is not a regular file: {fpath}"
+    try:
+        size = fpath.stat().st_size
+        if size > max_bytes:
+            return None, f"File size ({size} bytes) exceeds maximum limit {max_bytes} bytes"
+    except OSError as exc:
+        return None, f"Failed to stat file: {exc}"
+
+    try:
+        with fpath.open("rb") as f:
+            data = f.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return None, f"File read ({len(data)} bytes) exceeds maximum limit {max_bytes} bytes"
+        return data, None
+    except Exception as exc:
+        return None, f"Failed to read file: {exc}"
+
+
+def _read_bounded_json_envelope(fpath: Path) -> tuple[Any | None, str | None]:
+    """Safely read and parse a JSON envelope within MAX_ENVELOPE_BYTES before allocation.
+
+    Enforces MAX_ENVELOPE_BYTES before reading and bounds read length at MAX + 1.
+    Returns (data, None) on success or (None, error_reason) on failure.
+    """
+    data, err = _read_bounded_bytes(fpath, MAX_ENVELOPE_BYTES)
+    if err is not None:
+        return None, err
+    assert data is not None
+    try:
+        content = data.decode("utf-8")
+        return json.loads(content), None
+    except Exception as exc:
+        return None, f"Invalid JSON ({exc})"
+
+
+class ProspectiveCaptureContext:
+    """Thread-safe context manager capturing raw news response snapshots and cumulative archive envelopes.
+
+    Serializes sequence allocation, snapshot write, envelope update, temp write, fsync, os.replace,
+    and read-back verification under threading.RLock().
+    Installs scoped pre-format hooks on router.VENDOR_METHODS and direct vendor functions.
+    Restores original implementations cleanly on exit.
+    """
+
+    def __init__(
+        self,
+        cell_dir: Path | str,
+        ticker: str,
+        date_str: str,
+        arm: str,
+        attempt_id: str,
+        cutoff_iso: str | None = None,
+        audit_handler: AuditCallbackHandler | None = None,
+    ) -> None:
+        self.cell_dir = Path(cell_dir).resolve()
+        self.ticker = ticker
+        self.date_str = date_str
+        self.arm = arm
+        self.attempt_id = attempt_id
+        self.cutoff_iso = cutoff_iso
+        self.audit_handler = audit_handler
+        self._commit_lock = threading.RLock()
+        self._call_seq: int = 0
+        self.responses_dir = self.cell_dir / "data" / "responses"
+        if self.arm == "A":
+            self.archive_path = self.cell_dir / "data" / "baseline_archive.json"
+        else:
+            self.archive_path = self.cell_dir / "data" / "provenance_archive.json"
+        self._orig_hooks: dict[str, Any] = {}
+        self._active = False
+
+    def commit_call(
+        self,
+        tool_name: str,
+        query: str,
+        params: dict[str, Any],
+        raw_payload: Any,
+        extracted_records: list[dict[str, Any]],
+        output_text: str,
+        run_id: str | None = None,
+        received_at: str | None = None,
+        producer_params: dict[str, Any] | None = None,
+        feed_source: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically persist raw snapshot and update cumulative envelope under commit lock."""
+        with self._commit_lock:
+            try:
+                self.responses_dir.mkdir(parents=True, exist_ok=True)
+                self.archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+                self._call_seq += 1
+                seq = self._call_seq
+                call_id = str(uuid.uuid4())
+                snapshot_filename = f"{seq:03d}_{tool_name}_{call_id}.json"
+                snapshot_path = self.responses_dir / snapshot_filename
+                rel_snapshot_path = f"responses/{snapshot_filename}"
+
+                # Compute raw payload hash
+                serialized_payload = json.dumps(raw_payload, sort_keys=True)
+                raw_payload_hash = hashlib.sha256(serialized_payload.encode("utf-8")).hexdigest()
+
+                # Atomic write snapshot with fsync and read-back
+                temp_snap = self.responses_dir / f".tmp_{seq}_{uuid.uuid4().hex[:8]}"
+                with open(temp_snap, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(raw_payload, indent=2, sort_keys=True))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_snap, snapshot_path)
+
+                # Read-back verification of snapshot
+                read_snap_bytes, snap_read_err = _read_bounded_bytes(
+                    snapshot_path, MAX_SNAPSHOT_BYTES
+                )
+                if snap_read_err is not None or read_snap_bytes is None:
+                    raise EvidenceStorageError(f"Snapshot read-back failed: {snap_read_err}")
+                read_snap_obj = json.loads(read_snap_bytes.decode("utf-8"))
+                re_hash = hashlib.sha256(
+                    json.dumps(read_snap_obj, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+                if re_hash != raw_payload_hash:
+                    raise EvidenceStorageError(
+                        f"Snapshot read-back hash mismatch: expected {raw_payload_hash}, got {re_hash}"
+                    )
+
+                output_hash = hashlib.sha256(output_text.encode("utf-8")).hexdigest()
+                rec_at = received_at or datetime.now(UTC).isoformat()
+
+                # Clean extracted records: convert any datetime objects to ISO strings
+                cleaned_records: list[dict[str, Any]] = []
+                for rec_item in extracted_records:
+                    r_copy = dict(rec_item)
+                    for k_dt in ("pub_date", "publishedAt", "receivedAt", "enrichedAt"):
+                        val_dt = r_copy.get(k_dt)
+                        if hasattr(val_dt, "isoformat"):
+                            r_copy[k_dt] = val_dt.isoformat()
+                    cleaned_records.append(r_copy)
+
+                call_record = {
+                    "call_seq": seq,
+                    "call_id": call_id,
+                    "tool": tool_name,
+                    "run_id": run_id,
+                    "query": query,
+                    "received_at": rec_at,
+                    "params": params,
+                    "snapshot_path": rel_snapshot_path,
+                    "raw_payload_hash": raw_payload_hash,
+                    "records": cleaned_records,
+                    "output_hash": output_hash,
+                }
+                if producer_params is not None:
+                    call_record["producer_params"] = producer_params
+                if feed_source is not None:
+                    call_record["feed_source"] = feed_source
+
+                # Load or initialize cumulative envelope
+                if self.archive_path.exists():
+                    try:
+                        envelope = json.loads(self.archive_path.read_text(encoding="utf-8"))
+                    except Exception as exc:
+                        raise EvidenceStorageError(
+                            f"Failed to read cumulative envelope: {exc}"
+                        ) from exc
+                else:
+                    envelope = {
+                        "version": "t13-archive/v2",
+                        "attempt_id": self.attempt_id,
+                        "ticker": self.ticker,
+                        "arm": self.arm,
+                        "date": self.date_str,
+                        "cutoff": self.cutoff_iso,
+                        "vendor": "yfinance" if self.arm == "A" else "news_intelligence",
+                        "created_at": datetime.now(UTC).isoformat(),
+                        "calls": [],
+                        "articles" if self.arm == "A" else "events": [],
+                    }
+
+                envelope.setdefault("calls", []).append(call_record)
+                items_key = "articles" if self.arm == "A" else "events"
+                envelope.setdefault(items_key, []).extend(cleaned_records)
+
+                # Atomic write cumulative envelope with fsync and read-back
+                temp_env = self.archive_path.parent / f".tmp_env_{uuid.uuid4().hex[:8]}"
+                with open(temp_env, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(envelope, indent=2, sort_keys=True))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_env, self.archive_path)
+
+                # Read-back verification (R7: full content equality check)
+                read_env_bytes, env_read_err = _read_bounded_bytes(
+                    self.archive_path, MAX_ENVELOPE_BYTES
+                )
+                if env_read_err is not None or read_env_bytes is None:
+                    raise EvidenceStorageError(f"Envelope read-back failed: {env_read_err}")
+                read_env_obj = json.loads(read_env_bytes.decode("utf-8"))
+                if read_env_obj != envelope:
+                    raise EvidenceStorageError("Envelope read-back content verification failed")
+
+                return call_record
+
+            except EvidenceStorageError:
+                raise
+            except Exception as exc:
+                raise EvidenceStorageError(f"Evidence persistence failed: {exc}") from exc
+
+    def __enter__(self) -> ProspectiveCaptureContext:
+        self._active = True
+        self._orig_hooks = {}
+        import tradingagents.dataflows.router as router
+        import tradingagents.dataflows.vendors.news_intelligence.client as ni_client
+        import tradingagents.dataflows.vendors.yahoo.news as yahoo_news
+        from tradingagents.dataflows.date_window import in_window
+
+        context_self = self
+
+        if self.arm == "A":
+            orig_yf_retry = getattr(yahoo_news, "yf_retry", None)
+            orig_search = getattr(yahoo_news, "_search_news", None)
+            orig_get_news_yf = yahoo_news.get_news_yfinance
+            orig_get_global_yf = yahoo_news.get_global_news_yfinance
+
+            self._orig_hooks["yahoo_news.yf_retry"] = orig_yf_retry
+            self._orig_hooks["yahoo_news._search_news"] = orig_search
+            self._orig_hooks["yahoo_news.get_news_yfinance"] = orig_get_news_yf
+            self._orig_hooks["yahoo_news.get_global_news_yfinance"] = orig_get_global_yf
+            self._orig_hooks["router.get_news.yfinance"] = router.VENDOR_METHODS.get(
+                "get_news", {}
+            ).get("yfinance")
+            self._orig_hooks["router.get_global_news.yfinance"] = router.VENDOR_METHODS.get(
+                "get_global_news", {}
+            ).get("yfinance")
+
+            # Context-wide thread-isolated collectors (R2)
+            def capturing_yf_retry(fn: Any) -> Any:
+                res = orig_yf_retry(fn)
+                collector = getattr(_thread_capture_state, "yahoo_raw", None)
+                if collector is not None and isinstance(res, list):
+                    collector.extend(copy.deepcopy(res))
+                return res
+
+            def capturing_search(canonical: str, limit: int) -> tuple[list, bool]:
+                tagged, knows = orig_search(canonical, limit)
+                collector = getattr(_thread_capture_state, "yahoo_raw", None)
+                if collector is not None:
+                    _thread_capture_state.yahoo_feed_source = "search"
+                    if isinstance(tagged, list):
+                        collector.extend(copy.deepcopy(tagged))
+                return tagged, knows
+
+            yahoo_news.yf_retry = capturing_yf_retry
+            yahoo_news._search_news = capturing_search
+
+            def hooked_get_news_yfinance(ticker: str, start_date: str, end_date: str) -> str:
+                _thread_capture_state.yahoo_raw = []
+                _thread_capture_state.yahoo_feed_source = "feed"
+                try:
+                    out_str = orig_get_news_yf(ticker, start_date, end_date)
+                    rec_at = datetime.now(UTC).isoformat()  # Record immediately AFTER return (R4)
+                    captured_raw = list(getattr(_thread_capture_state, "yahoo_raw", []) or [])
+                    feed_source = getattr(_thread_capture_state, "yahoo_feed_source", "feed")
+                finally:
+                    _thread_capture_state.yahoo_raw = None
+                    _thread_capture_state.yahoo_feed_source = None
+
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                extracted = [yahoo_news._extract_article_data(a) for a in captured_raw]
+                in_range = [a for a in extracted if in_window(a["pub_date"], start_dt, end_dt)]
+                norm_records = []
+                for a in in_range:
+                    rc = dict(a)
+                    val_dt = rc.get("pub_date")
+                    if hasattr(val_dt, "isoformat"):
+                        rc["pub_date"] = val_dt.isoformat()
+                    norm_records.append(rc)
+
+                active_run_id = getattr(_current_tool_run_id, "value", None)
+                producer_p = {"ticker": ticker, "start_date": start_date, "end_date": end_date}
+                context_self.commit_call(
+                    tool_name="get_news",
+                    query=ticker,
+                    params={"ticker": ticker, "start_date": start_date, "end_date": end_date},
+                    raw_payload=captured_raw,
+                    extracted_records=norm_records,
+                    output_text=out_str,
+                    run_id=active_run_id,
+                    received_at=rec_at,
+                    producer_params=producer_p,
+                    feed_source=feed_source,
+                )
+                return out_str
+
+            def hooked_get_global_news_yfinance(
+                as_of_date: str, look_back_days: int | None = None, limit: int | None = None
+            ) -> str:
+                _thread_capture_state.yahoo_raw = []
+                _thread_capture_state.yahoo_feed_source = "feed"
+                try:
+                    out_str = orig_get_global_yf(
+                        as_of_date, look_back_days=look_back_days, limit=limit
+                    )
+                    rec_at = datetime.now(UTC).isoformat()  # Record immediately AFTER return (R4)
+                    captured_raw = list(getattr(_thread_capture_state, "yahoo_raw", []) or [])
+                    feed_source = getattr(_thread_capture_state, "yahoo_feed_source", "feed")
+                finally:
+                    _thread_capture_state.yahoo_raw = None
+                    _thread_capture_state.yahoo_feed_source = None
+
+                cfg = get_config()
+                eff_lb = (
+                    look_back_days
+                    if look_back_days is not None
+                    else cfg.get("global_news_lookback_days", 7)
+                )
+                eff_lim = limit if limit is not None else cfg.get("global_news_article_limit", 10)
+                curr_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
+                start_dt = curr_dt - relativedelta(days=eff_lb)
+                extracted = [yahoo_news._extract_article_data(a) for a in captured_raw]
+                seen_titles = set()
+                in_win = []
+                for a in extracted:
+                    if (
+                        in_window(a["pub_date"], start_dt, curr_dt)
+                        and a["title"]
+                        and a["title"] not in seen_titles
+                    ):
+                        seen_titles.add(a["title"])
+                        in_win.append(a)
+                sub = in_win[:eff_lim]
+                norm_records = []
+                for a in sub:
+                    rc = dict(a)
+                    val_dt = rc.get("pub_date")
+                    if hasattr(val_dt, "isoformat"):
+                        rc["pub_date"] = val_dt.isoformat()
+                    norm_records.append(rc)
+
+                active_run_id = getattr(_current_tool_run_id, "value", None)
+                producer_p = {
+                    "as_of_date": as_of_date,
+                    "look_back_days": look_back_days,
+                    "limit": limit,
+                }
+                context_self.commit_call(
+                    tool_name="get_global_news",
+                    query="global",
+                    params={
+                        "as_of_date": as_of_date,
+                        "look_back_days": look_back_days,
+                        "limit": limit,
+                    },
+                    raw_payload=captured_raw,
+                    extracted_records=norm_records,
+                    output_text=out_str,
+                    run_id=active_run_id,
+                    received_at=rec_at,
+                    producer_params=producer_p,
+                    feed_source=feed_source,
+                )
+                return out_str
+
+            yahoo_news.get_news_yfinance = hooked_get_news_yfinance
+            yahoo_news.get_global_news_yfinance = hooked_get_global_news_yfinance
+            if "get_news" in router.VENDOR_METHODS:
+                router.VENDOR_METHODS["get_news"]["yfinance"] = hooked_get_news_yfinance
+            if "get_global_news" in router.VENDOR_METHODS:
+                router.VENDOR_METHODS["get_global_news"]["yfinance"] = (
+                    hooked_get_global_news_yfinance
+                )
+
+        elif self.arm == "B":
+            orig_make_request = ni_client.NewsIntelligenceClient._make_request
+            orig_client_get_news = ni_client.NewsIntelligenceClient.get_news
+            orig_client_get_global = ni_client.NewsIntelligenceClient.get_global_news
+            orig_mod_get_news = getattr(ni_client, "get_news_news_intelligence", None)
+            orig_mod_get_global = getattr(ni_client, "get_global_news_news_intelligence", None)
+
+            self._orig_hooks["ni_client.NewsIntelligenceClient._make_request"] = orig_make_request
+            self._orig_hooks["ni_client.NewsIntelligenceClient.get_news"] = orig_client_get_news
+            self._orig_hooks["ni_client.NewsIntelligenceClient.get_global_news"] = (
+                orig_client_get_global
+            )
+            self._orig_hooks["ni_client.get_news_news_intelligence"] = orig_mod_get_news
+            self._orig_hooks["ni_client.get_global_news_news_intelligence"] = orig_mod_get_global
+            self._orig_hooks["router.get_news.news_intelligence"] = router.VENDOR_METHODS.get(
+                "get_news", {}
+            ).get("news_intelligence")
+            self._orig_hooks["router.get_global_news.news_intelligence"] = (
+                router.VENDOR_METHODS.get("get_global_news", {}).get("news_intelligence")
+            )
+
+            def hooked_make_request(
+                client_self: Any, endpoint: str, params: dict[str, Any]
+            ) -> dict[str, Any]:
+                data = orig_make_request(client_self, endpoint, params)
+                rec_at = datetime.now(UTC).isoformat()  # Record immediately AFTER return (R4)
+                reqs = getattr(_thread_capture_state, "repo1_requests", None)
+                if reqs is not None:
+                    reqs.append(
+                        {
+                            "endpoint": endpoint,
+                            "params": copy.deepcopy(params),
+                            "data": copy.deepcopy(data),
+                            "received_at": rec_at,
+                        }
+                    )
+                return data
+
+            def hooked_get_news(
+                client_self: Any, ticker: str, start_date: str, end_date: str
+            ) -> str:
+                _thread_capture_state.repo1_requests = []
+                try:
+                    out_str = orig_client_get_news(client_self, ticker, start_date, end_date)
+                    rec_at = datetime.now(UTC).isoformat()
+                    captured_reqs = list(getattr(_thread_capture_state, "repo1_requests", []) or [])
+                finally:
+                    _thread_capture_state.repo1_requests = None
+
+                matching_reqs = [
+                    r
+                    for r in captured_reqs
+                    if r.get("endpoint") in ("/api/v1/news", "/api/v1/news/global")
+                ]
+                raw_payload = matching_reqs[-1]["data"] if matching_reqs else {"events": []}
+                rec_at = matching_reqs[-1]["received_at"] if matching_reqs else rec_at
+                raw_params = (
+                    matching_reqs[-1]["params"]
+                    if matching_reqs
+                    else {"symbol": ticker, "from": start_date, "to": end_date}
+                )
+
+                query_sym, resolved = ni_client.map_ticker_for_news_intelligence(ticker)
+                as_of = ni_client.to_iso_utc(end_date, end_of_day=True)
+                min_pub = ni_client.to_iso_utc(start_date, end_of_day=False)
+                max_pub = ni_client.to_iso_utc(end_date, end_of_day=True)
+                cutoff_dt = ni_client.parse_utc_timestamp(as_of)
+                min_pub_dt = ni_client.parse_utc_timestamp(min_pub)
+                max_pub_dt = ni_client.parse_utc_timestamp(max_pub)
+
+                raw_events = raw_payload.get("events") or []
+                sanitized_events = []
+                for raw_event in raw_events:
+                    if not ni_client.validate_canonical_event(raw_event):
+                        continue
+                    ev = ni_client.filter_and_sanitize_event(
+                        raw_event,
+                        cutoff_dt=cutoff_dt,
+                        min_pub_dt=min_pub_dt,
+                        max_pub_dt=max_pub_dt,
+                    )
+                    if ev is not None and query_sym in ev.get("symbols", []):
+                        sanitized_events.append(ev)
+
+                limit = get_config().get("news_article_limit", 20)
+                active_run_id = getattr(_current_tool_run_id, "value", None)
+                producer_p = {
+                    "ticker": ticker,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "limit": limit,
+                }
+                context_self.commit_call(
+                    tool_name="get_news",
+                    query=ticker,
+                    params=raw_params,
+                    raw_payload=raw_payload,
+                    extracted_records=sanitized_events[:limit],
+                    output_text=out_str,
+                    run_id=active_run_id,
+                    received_at=rec_at,
+                    producer_params=producer_p,
+                )
+                return out_str
+
+            def hooked_get_global_news(
+                client_self: Any,
+                as_of_date: str,
+                look_back_days: int | None = None,
+                limit: int | None = None,
+            ) -> str:
+                _thread_capture_state.repo1_requests = []
+                try:
+                    out_str = orig_client_get_global(
+                        client_self, as_of_date, look_back_days=look_back_days, limit=limit
+                    )
+                    rec_at = datetime.now(UTC).isoformat()
+                    captured_reqs = list(getattr(_thread_capture_state, "repo1_requests", []) or [])
+                finally:
+                    _thread_capture_state.repo1_requests = None
+
+                matching_reqs = [
+                    r
+                    for r in captured_reqs
+                    if r.get("endpoint") in ("/api/v1/news/global", "/api/v1/news")
+                ]
+                raw_payload = matching_reqs[-1]["data"] if matching_reqs else {"events": []}
+                rec_at = matching_reqs[-1]["received_at"] if matching_reqs else rec_at
+                raw_params = (
+                    matching_reqs[-1]["params"]
+                    if matching_reqs
+                    else {
+                        "symbol": "GLOBAL",
+                        "asOf": as_of_date,
+                    }
+                )
+
+                cfg = get_config()
+                eff_lb = (
+                    look_back_days
+                    if look_back_days is not None
+                    else cfg.get("global_news_lookback_days", 7)
+                )
+                eff_lim = limit if limit is not None else cfg.get("global_news_article_limit", 10)
+                curr_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
+                start_dt = curr_dt - timedelta(days=eff_lb)
+                start_date = start_dt.strftime("%Y-%m-%d")
+
+                as_of = ni_client.to_iso_utc(as_of_date, end_of_day=True)
+                min_pub = ni_client.to_iso_utc(start_date, end_of_day=False)
+                max_pub = ni_client.to_iso_utc(as_of_date, end_of_day=True)
+                cutoff_dt = ni_client.parse_utc_timestamp(as_of)
+                min_pub_dt = ni_client.parse_utc_timestamp(min_pub)
+                max_pub_dt = ni_client.parse_utc_timestamp(max_pub)
+
+                raw_events = raw_payload.get("events") or []
+                sanitized_events = []
+                for raw_event in raw_events:
+                    if not ni_client.validate_canonical_event(raw_event):
+                        continue
+                    ev = ni_client.filter_and_sanitize_event(
+                        raw_event,
+                        cutoff_dt=cutoff_dt,
+                        min_pub_dt=min_pub_dt,
+                        max_pub_dt=max_pub_dt,
+                    )
+                    if ev is not None:
+                        sanitized_events.append(ev)
+
+                active_run_id = getattr(_current_tool_run_id, "value", None)
+                producer_p = {
+                    "as_of_date": as_of_date,
+                    "look_back_days": look_back_days,
+                    "limit": limit,
+                }
+                context_self.commit_call(
+                    tool_name="get_global_news",
+                    query="global",
+                    params=raw_params,
+                    raw_payload=raw_payload,
+                    extracted_records=sanitized_events[:eff_lim],
+                    output_text=out_str,
+                    run_id=active_run_id,
+                    received_at=rec_at,
+                    producer_params=producer_p,
+                )
+                return out_str
+
+            def hooked_mod_get_news(ticker: str, start_date: str, end_date: str) -> str:
+                cl = ni_client.NewsIntelligenceClient()
+                return hooked_get_news(cl, ticker, start_date, end_date)
+
+            def hooked_mod_get_global(
+                as_of_date: str, look_back_days: int | None = None, limit: int | None = None
+            ) -> str:
+                cl = ni_client.NewsIntelligenceClient()
+                return hooked_get_global_news(
+                    cl, as_of_date, look_back_days=look_back_days, limit=limit
+                )
+
+            ni_client.NewsIntelligenceClient._make_request = hooked_make_request
+            ni_client.NewsIntelligenceClient.get_news = hooked_get_news
+            ni_client.NewsIntelligenceClient.get_global_news = hooked_get_global_news
+            ni_client.get_news_news_intelligence = hooked_mod_get_news
+            ni_client.get_global_news_news_intelligence = hooked_mod_get_global
+            if "get_news" in router.VENDOR_METHODS:
+                router.VENDOR_METHODS["get_news"]["news_intelligence"] = hooked_mod_get_news
+            if "get_global_news" in router.VENDOR_METHODS:
+                router.VENDOR_METHODS["get_global_news"]["news_intelligence"] = (
+                    hooked_mod_get_global
+                )
+
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self._active = False
+        import tradingagents.dataflows.router as router
+        import tradingagents.dataflows.vendors.news_intelligence.client as ni_client
+        import tradingagents.dataflows.vendors.yahoo.news as yahoo_news
+
+        if "yahoo_news.yf_retry" in self._orig_hooks:
+            yahoo_news.yf_retry = self._orig_hooks["yahoo_news.yf_retry"]
+        if "yahoo_news._search_news" in self._orig_hooks:
+            yahoo_news._search_news = self._orig_hooks["yahoo_news._search_news"]
+        if "yahoo_news.get_news_yfinance" in self._orig_hooks:
+            yahoo_news.get_news_yfinance = self._orig_hooks["yahoo_news.get_news_yfinance"]
+        if "yahoo_news.get_global_news_yfinance" in self._orig_hooks:
+            yahoo_news.get_global_news_yfinance = self._orig_hooks[
+                "yahoo_news.get_global_news_yfinance"
+            ]
+        if "router.get_news.yfinance" in self._orig_hooks and "get_news" in router.VENDOR_METHODS:
+            router.VENDOR_METHODS["get_news"]["yfinance"] = self._orig_hooks[
+                "router.get_news.yfinance"
+            ]
+        if (
+            "router.get_global_news.yfinance" in self._orig_hooks
+            and "get_global_news" in router.VENDOR_METHODS
+        ):
+            router.VENDOR_METHODS["get_global_news"]["yfinance"] = self._orig_hooks[
+                "router.get_global_news.yfinance"
+            ]
+
+        if "ni_client.NewsIntelligenceClient._make_request" in self._orig_hooks:
+            ni_client.NewsIntelligenceClient._make_request = self._orig_hooks[
+                "ni_client.NewsIntelligenceClient._make_request"
+            ]
+        if "ni_client.NewsIntelligenceClient.get_news" in self._orig_hooks:
+            ni_client.NewsIntelligenceClient.get_news = self._orig_hooks[
+                "ni_client.NewsIntelligenceClient.get_news"
+            ]
+        if "ni_client.NewsIntelligenceClient.get_global_news" in self._orig_hooks:
+            ni_client.NewsIntelligenceClient.get_global_news = self._orig_hooks[
+                "ni_client.NewsIntelligenceClient.get_global_news"
+            ]
+        if "ni_client.get_news_news_intelligence" in self._orig_hooks:
+            ni_client.get_news_news_intelligence = self._orig_hooks[
+                "ni_client.get_news_news_intelligence"
+            ]
+        if "ni_client.get_global_news_news_intelligence" in self._orig_hooks:
+            ni_client.get_global_news_news_intelligence = self._orig_hooks[
+                "ni_client.get_global_news_news_intelligence"
+            ]
+        if (
+            "router.get_news.news_intelligence" in self._orig_hooks
+            and "get_news" in router.VENDOR_METHODS
+        ):
+            router.VENDOR_METHODS["get_news"]["news_intelligence"] = self._orig_hooks[
+                "router.get_news.news_intelligence"
+            ]
+        if (
+            "router.get_global_news.news_intelligence" in self._orig_hooks
+            and "get_global_news" in router.VENDOR_METHODS
+        ):
+            router.VENDOR_METHODS["get_global_news"]["news_intelligence"] = self._orig_hooks[
+                "router.get_global_news.news_intelligence"
+            ]
+
+        self._orig_hooks.clear()
+
+
+# ---------------------------------------------------------------------------
 # Runner Execution: Decision Generation (R2, R3, R4, R5, R6, R8)
 # ---------------------------------------------------------------------------
 
@@ -991,10 +1675,19 @@ def run_experiment(manifest: dict[str, Any], output_dir: Path | str) -> dict[str
                 graph.propagator.get_graph_args = _get_graph_args_with_cb
 
             try:
-                # Call propagate returning (final_state, signal) (R2)
-                final_state, signal = graph.propagate(
-                    ticker, date_str, asset_type=asset_type, portfolio=portfolio
-                )
+                # Prospective evidence capture context wraps graph execution (R1, R2, R4)
+                with ProspectiveCaptureContext(
+                    cell_dir=cell_dir,
+                    ticker=ticker,
+                    date_str=date_str,
+                    arm=arm,
+                    attempt_id=attempt_id,
+                    audit_handler=audit_cb,
+                ):
+                    # Call propagate returning (final_state, signal) (R2)
+                    final_state, signal = graph.propagate(
+                        ticker, date_str, asset_type=asset_type, portfolio=portfolio
+                    )
                 report_file = graph.save_reports(final_state, ticker, save_path=results_dir)
 
                 mem_log = TradingMemoryLog({"memory_log_path": str(mem_log_path)})
@@ -1041,6 +1734,33 @@ def run_experiment(manifest: dict[str, Any], output_dir: Path | str) -> dict[str
             except (JournalPersistenceError, JournalVerificationError):
                 # R4: Fail-closed journal errors must immediately re-raise!
                 raise
+            except EvidenceStorageError as exc:
+                # Fatal storage error: record in journal, mark FAILED_INCOMPLETE, zero paid replay
+                attempt_rec["phase"] = "failed"
+                attempt_rec["status"] = "FAILED_INCOMPLETE"
+                attempt_rec["completed_at"] = datetime.now(UTC).isoformat()
+                attempt_rec["error"] = sanitize_text(f"EvidenceStorageError: {exc}")
+                attempt_rec["model_calls"] = audit_cb.model_calls
+                attempt_rec["model_usage"] = audit_cb.token_usage
+                attempt_rec["has_unknown_usage"] = True
+
+                trace_file = results_dir / "audit_trace.json"
+                with suppress(Exception):
+                    trace_payload = {
+                        "cell_key": cell_key,
+                        "attempt_id": attempt_id,
+                        "model_calls": audit_cb.model_calls,
+                        "tool_calls": audit_cb.tool_calls,
+                        "token_usage": audit_cb.token_usage,
+                        "has_unknown_usage": True,
+                        "traces": audit_cb.traces,
+                        "error": sanitize_text(f"EvidenceStorageError: {exc}"),
+                    }
+                    trace_file.write_text(json.dumps(trace_payload, indent=2), encoding="utf-8")
+                    attempt_rec["audit_trace_path"] = str(trace_file.relative_to(output_root))
+
+                _persist_journal(output_root, journal)
+                continue
             except Exception as exc:
                 attempt_rec["phase"] = "failed"
                 attempt_rec["completed_at"] = datetime.now(UTC).isoformat()
@@ -1710,9 +2430,8 @@ def _find_valid_json_files(paths: list[Path]) -> list[Path]:
 
 
 def _verify_timing_clock_file(fpath: Path, ticker: str, date_val: str, cutoff: datetime) -> bool:
-    try:
-        data = json.loads(fpath.read_text(encoding="utf-8"))
-    except Exception:
+    data, err = _read_bounded_json_envelope(fpath)
+    if err is not None or not data or not isinstance(data, (dict, list)):
         return False
 
     if not data or not isinstance(data, (dict, list)):
@@ -1785,64 +2504,54 @@ def _verify_timing_clock_file(fpath: Path, ticker: str, date_val: str, cutoff: d
     return found_matching
 
 
+def _parse_strict_tool_start_input(raw_input: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse tool_start input strictly as JSON or Python-style mapping.
+
+    Rejects None, empty/whitespace, scalars, lists, and unparseable text.
+    Permissive regex fallback is not allowed for strict request binding (HIGH1).
+    """
+    if raw_input is None:
+        return None, "tool_start missing input"
+    if isinstance(raw_input, dict):
+        return raw_input, None
+    if isinstance(raw_input, str):
+        s = raw_input.strip()
+        if not s:
+            return None, "tool_start has empty input"
+        # 1. Try strict JSON
+        try:
+            val = json.loads(s)
+            if isinstance(val, dict):
+                return val, None
+            return (
+                None,
+                f"tool_start input JSON must decode to a dictionary (object), got {type(val).__name__}",
+            )
+        except Exception:
+            pass
+        # 2. Try Python-style literal mapping (ast.literal_eval)
+        try:
+            import ast
+
+            val = ast.literal_eval(s)
+            if isinstance(val, dict):
+                return val, None
+            return (
+                None,
+                f"tool_start input mapping must decode to a dictionary (object), got {type(val).__name__}",
+            )
+        except Exception as exc:
+            return None, f"tool_start input is not valid JSON or mapping: {exc}"
+    return (
+        None,
+        f"tool_start input must be a dictionary or JSON/mapping string, got {type(raw_input).__name__}",
+    )
+
+
 def _extract_tool_start_params(input_val: Any) -> dict[str, Any]:
     """Extract tool arguments from tool_start trace input."""
-    if isinstance(input_val, dict):
-        return input_val
-    if not isinstance(input_val, str):
-        return {}
-    s = input_val.strip()
-    if not s:
-        return {}
-    with suppress(Exception):
-        d = json.loads(s)
-        if isinstance(d, dict):
-            return d
-    with suppress(Exception):
-        import ast
-
-        d = ast.literal_eval(s)
-        if isinstance(d, dict):
-            return d
-    params: dict[str, Any] = {}
-    m_sym = re.search(
-        r"['\"]?(?:ticker|symbol|query)['\"]?\s*[:=]\s*['\"]([^'\"]+)['\"]",
-        s,
-        re.IGNORECASE,
-    )
-    if m_sym:
-        params["ticker"] = m_sym.group(1)
-    m_date = re.search(
-        r"['\"]?(?:end_date|trade_date|curr_date|as_of|asOf|date)['\"]?\s*[:=]\s*['\"]([^'\"]+)['\"]",
-        s,
-        re.IGNORECASE,
-    )
-    if m_date:
-        params["date"] = m_date.group(1)
-    m_start = re.search(
-        r"['\"]?(?:start_date|from)['\"]?\s*[:=]\s*['\"]([^'\"]+)['\"]",
-        s,
-        re.IGNORECASE,
-    )
-    if m_start:
-        params["start_date"] = m_start.group(1)
-    m_lb = re.search(
-        r"['\"]?(?:look_back_days|lookback_days)['\"]?\s*[:=]\s*(['\"]?[0-9]+['\"]?|None|null)",
-        s,
-        re.IGNORECASE,
-    )
-    if m_lb:
-        val_str = m_lb.group(1).strip("'\"").lower()
-        params["look_back_days"] = None if val_str in ("none", "null") else int(val_str)
-    m_lim = re.search(
-        r"['\"]?(?:limit|article_limit)['\"]?\s*[:=]\s*(['\"]?[0-9]+['\"]?|None|null)",
-        s,
-        re.IGNORECASE,
-    )
-    if m_lim:
-        val_str = m_lim.group(1).strip("'\"").lower()
-        params["limit"] = None if val_str in ("none", "null") else int(val_str)
-    return params
+    parsed, _ = _parse_strict_tool_start_input(input_val)
+    return parsed if parsed is not None else {}
 
 
 def _resolve_and_validate_clock(
@@ -2047,6 +2756,1045 @@ def _copy_top_level_wrapper_keys(target_dict: dict[str, Any], source_dict: dict[
         target_dict[pk] = source_dict[pk]
 
 
+MAX_SNAPSHOT_BYTES = 10 * 1024 * 1024  # 10 MB limit
+MAX_ARCHIVE_CALLS = 100
+MAX_CALL_RECORDS = 500
+
+
+def _verify_v2_archive(
+    data: dict[str, Any],
+    fpath: Path,
+    arm: str,
+    ticker: str,
+    date_val: str,
+    dt_cutoff: datetime,
+    decision_att: dict[str, Any],
+    cell_dir: Path,
+    news_ends: list[dict[str, Any]],
+    tr_data: dict[str, Any],
+) -> tuple[bool, str]:
+    """Strict unbroken derivation verification for t13-archive/v2 envelopes.
+
+    Enforces:
+    1. Bounded snapshot read & raw SHA-256 digest verification with strict path containment (R6).
+    2. Native normalization (Arm A) and point-in-time sanitization (Arm B).
+    3. Arm-specific field-by-field record equality without fabricated clocks.
+    4. Complete native producer response reconstruction (headers, windows, limit truncation, sentinels) (R5).
+    5. Exact hash and text comparison with 1-to-1 bijection against observed tool executions in audit_trace.json (R3, R4).
+    Fails closed immediately on any violation; never falls back to legacy candidate matching.
+    """
+    att_expected = decision_att.get("attempt_id")
+    top_att = data.get("attempt_id")
+    if not top_att or top_att != att_expected:
+        return (
+            False,
+            f"Archive v2 verification failure: attempt_id '{top_att}' does not match expected '{att_expected}'",
+        )
+
+    top_arm = data.get("arm")
+    if not top_arm or top_arm != arm:
+        return (
+            False,
+            f"Archive v2 verification failure: arm '{top_arm}' does not match expected '{arm}'",
+        )
+
+    top_ticker = data.get("ticker")
+    if not top_ticker or top_ticker != ticker:
+        return (
+            False,
+            f"Archive v2 verification failure: ticker '{top_ticker}' does not match expected '{ticker}'",
+        )
+
+    top_date = data.get("date")
+    if not top_date or top_date != date_val:
+        return (
+            False,
+            f"Archive v2 verification failure: date '{top_date}' does not match expected '{date_val}'",
+        )
+
+    top_cutoff = data.get("cutoff")
+    if top_cutoff is not None:
+        dt_top_cut = _parse_utc_iso(str(top_cutoff))
+        if not dt_top_cut or dt_top_cut > dt_cutoff:
+            return (
+                False,
+                f"Archive v2 verification failure: cutoff '{top_cutoff}' exceeds entry cutoff {dt_cutoff.isoformat()}",
+            )
+
+    top_vendor = data.get("vendor")
+    if arm == "A" and top_vendor not in ("yfinance", "yahoo"):
+        return (
+            False,
+            f"Archive v2 verification failure: Arm A requires yfinance/yahoo vendor, got '{top_vendor}'",
+        )
+    if arm == "B" and top_vendor not in ("news_intelligence", "repo1"):
+        return (
+            False,
+            f"Archive v2 verification failure: Arm B requires news_intelligence/repo1 vendor, got '{top_vendor}'",
+        )
+
+    calls = data.get("calls")
+    if not calls or not isinstance(calls, list) or len(calls) == 0:
+        return False, "Archive v2 verification failure: missing or empty calls list"
+
+    if len(calls) > MAX_ARCHIVE_CALLS:
+        return (
+            False,
+            f"Archive v2 verification failure: call count {len(calls)} exceeds maximum limit {MAX_ARCHIVE_CALLS}",
+        )
+
+    # 1-to-1 cardinality check (R3): every observed news tool execution must be covered by an archive call
+    news_starts = [
+        t
+        for t in tr_data.get("traces", [])
+        if isinstance(t, dict)
+        and t.get("type") == "tool_start"
+        and (
+            str(t.get("tool", "")).startswith("get_news")
+            or str(t.get("tool", "")).startswith("get_global_news")
+        )
+    ]
+    news_ends = [
+        t
+        for t in tr_data.get("traces", [])
+        if isinstance(t, dict)
+        and t.get("type") == "tool_end"
+        and (
+            str(t.get("tool", "")).startswith("get_news")
+            or str(t.get("tool", "")).startswith("get_global_news")
+        )
+    ]
+
+    if len(calls) != len(news_ends):
+        return (
+            False,
+            f"Archive v2 verification failure: call count ({len(calls)}) does not match observed news tool execution count ({len(news_ends)})",
+        )
+
+    if len(calls) != len(news_starts):
+        return (
+            False,
+            f"Archive v2 verification failure: call count ({len(calls)}) does not match observed news tool start count ({len(news_starts)})",
+        )
+
+    bound_run_ids: set[str] = set()
+
+    for call in calls:
+        if not isinstance(call, dict):
+            return False, "Archive v2 verification failure: call entry must be a dictionary"
+
+        call_run_id = call.get("run_id")
+        if not call_run_id or not isinstance(call_run_id, str):
+            return False, "Archive v2 verification failure: call missing valid run_id"
+
+        if call_run_id in bound_run_ids:
+            return (
+                False,
+                f"Archive v2 verification failure: duplicate binding to run_id '{call_run_id}'",
+            )
+        bound_run_ids.add(call_run_id)
+
+        snap_rel = call.get("snapshot_path")
+        if not snap_rel or not isinstance(snap_rel, str):
+            return False, "Archive v2 verification failure: call missing valid snapshot_path"
+
+        # Containment & escape rejection (R6)
+        if os.path.isabs(snap_rel) or Path(snap_rel).is_absolute() or ".." in Path(snap_rel).parts:
+            return (
+                False,
+                f"Archive v2 verification failure: snapshot path must be relative without traversal: {snap_rel}",
+            )
+
+        candidates = [
+            (cell_dir / "data" / snap_rel).resolve(),
+            (cell_dir / snap_rel).resolve(),
+            (fpath.parent / snap_rel).resolve(),
+            (fpath.parent / "responses" / Path(snap_rel).name).resolve(),
+            (cell_dir / "data" / "responses" / Path(snap_rel).name).resolve(),
+        ]
+        snap_path: Path | None = None
+        cell_resolved = cell_dir.resolve()
+        for c in candidates:
+            if c.exists() and c.is_relative_to(cell_resolved):
+                snap_path = c
+                break
+
+        if not snap_path:
+            return (
+                False,
+                f"Archive v2 verification failure: snapshot file missing on disk or escapes cell: {snap_rel}",
+            )
+
+        if snap_path.is_symlink():
+            return (
+                False,
+                f"Archive v2 verification failure: snapshot path cannot be a symlink: {snap_rel}",
+            )
+
+        if not snap_path.is_file():
+            return (
+                False,
+                f"Archive v2 verification failure: snapshot path is not a regular file: {snap_rel}",
+            )
+
+        # Step 1: Bounded Snapshot Read & Hash Verification (MED3)
+        snap_bytes, snap_err = _read_bounded_bytes(snap_path, MAX_SNAPSHOT_BYTES)
+        if snap_err is not None or snap_bytes is None:
+            return (
+                False,
+                f"Archive v2 verification failure: {snap_err}",
+            )
+        try:
+            snap_payload = json.loads(snap_bytes.decode("utf-8"))
+        except Exception as exc:
+            return (
+                False,
+                f"Archive v2 verification failure: snapshot JSON decode failed: {exc}",
+            )
+
+        comp_raw_hash = hashlib.sha256(
+            json.dumps(snap_payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        decl_raw_hash = call.get("raw_payload_hash")
+        if not decl_raw_hash or comp_raw_hash != decl_raw_hash:
+            return (
+                False,
+                f"Archive v2 verification failure: snapshot hash mismatch ({comp_raw_hash} != {decl_raw_hash})",
+            )
+
+        # Validate snapshot payload shape (MED3)
+        if arm == "A":
+            if not isinstance(snap_payload, list):
+                return (
+                    False,
+                    f"Archive v2 verification failure: Arm A snapshot payload must be a list of raw articles, got {type(snap_payload).__name__}",
+                )
+            for idx, a_raw in enumerate(snap_payload):
+                if not isinstance(a_raw, dict):
+                    return (
+                        False,
+                        f"Archive v2 verification failure: Arm A raw article at index {idx} must be a dictionary, got {type(a_raw).__name__}",
+                    )
+        elif arm == "B":
+            if not isinstance(snap_payload, dict):
+                return (
+                    False,
+                    f"Archive v2 verification failure: Arm B snapshot payload must be a dictionary containing 'events', got {type(snap_payload).__name__}",
+                )
+            raw_events_chk = snap_payload.get("events")
+            if not isinstance(raw_events_chk, list):
+                return (
+                    False,
+                    f"Archive v2 verification failure: Arm B snapshot 'events' must be a list, got {type(raw_events_chk).__name__}",
+                )
+            for idx, e_raw in enumerate(raw_events_chk):
+                if not isinstance(e_raw, dict):
+                    return (
+                        False,
+                        f"Archive v2 verification failure: Arm B raw event at index {idx} must be a dictionary, got {type(e_raw).__name__}",
+                    )
+
+        # Observation clock verification (R4)
+        rec_at = call.get("received_at")
+        if not rec_at:
+            return False, "Archive v2 verification failure: call missing received_at"
+        dt_rec = _parse_utc_iso(str(rec_at))
+        if not dt_rec or dt_rec > dt_cutoff:
+            return (
+                False,
+                f"Archive v2 verification failure: call received_at '{rec_at}' exceeds entry cutoff {dt_cutoff.isoformat()}",
+            )
+
+        tool_name = str(call.get("tool", ""))
+        prod_p_raw = call.get("producer_params")
+        if prod_p_raw is not None and not isinstance(prod_p_raw, dict):
+            return (
+                False,
+                f"Archive v2 verification failure: call producer_params must be a dictionary if present, got {type(prod_p_raw).__name__}",
+            )
+
+        params_raw = call.get("params")
+        if params_raw is not None and not isinstance(params_raw, dict):
+            return (
+                False,
+                f"Archive v2 verification failure: call params must be a dictionary if present, got {type(params_raw).__name__}",
+            )
+        params = params_raw or {}
+        prod_p = prod_p_raw if prod_p_raw is not None else params
+
+        stored_records = call.get("records")
+        if stored_records is None or not isinstance(stored_records, list):
+            return False, "Archive v2 verification failure: call missing records list"
+        if len(stored_records) > MAX_CALL_RECORDS:
+            return (
+                False,
+                f"Archive v2 verification failure: record count {len(stored_records)} exceeds limit {MAX_CALL_RECORDS}",
+            )
+
+        for idx, r_item in enumerate(stored_records):
+            if not isinstance(r_item, dict):
+                return (
+                    False,
+                    f"Archive v2 verification failure: call records item at index {idx} must be a dictionary, got {type(r_item).__name__}",
+                )
+
+        # Consumed records timestamp cutoff check (R4)
+        for r_item in stored_records:
+            for k_ts in ("publishedAt", "receivedAt", "enrichedAt", "pub_date"):
+                val = r_item.get(k_ts)
+                if val is not None:
+                    if not isinstance(val, (str, int, float)):
+                        return (
+                            False,
+                            f"Archive v2 verification failure: record {k_ts} has invalid non-scalar type {type(val).__name__}",
+                        )
+                    dt_val = _parse_utc_iso(str(val))
+                    if dt_val and dt_val > dt_cutoff:
+                        return (
+                            False,
+                            f"Archive v2 verification failure: record {k_ts} '{val}' exceeds entry cutoff {dt_cutoff.isoformat()}",
+                        )
+
+        # Match exactly one tool_end with run_id == call_run_id (R3, HIGH1)
+        matching_ne_list = [ne for ne in news_ends if ne.get("run_id") == call_run_id]
+        if len(matching_ne_list) != 1:
+            return (
+                False,
+                f"Archive v2 verification failure: expected exactly one observed tool_end for run_id '{call_run_id}', found {len(matching_ne_list)}",
+            )
+        matching_ne = matching_ne_list[0]
+
+        # Match exactly one tool_start with run_id == call_run_id (R3, HIGH1)
+        matching_ns_list = [ns for ns in news_starts if ns.get("run_id") == call_run_id]
+        if len(matching_ns_list) != 1:
+            return (
+                False,
+                f"Archive v2 verification failure: expected exactly one observed tool_start for run_id '{call_run_id}', found {len(matching_ns_list)}",
+            )
+        matching_ns = matching_ns_list[0]
+
+        if not str(matching_ne.get("tool", "")).startswith(tool_name) or not str(
+            matching_ns.get("tool", "")
+        ).startswith(tool_name):
+            return (
+                False,
+                f"Archive v2 verification failure: tool name mismatch for run_id '{call_run_id}'",
+            )
+
+        # Parse and validate tool_start input strictly as a valid argument object (HIGH1, R3)
+        ns_input_raw = matching_ns.get("input")
+        ns_input, ns_err = _parse_strict_tool_start_input(ns_input_raw)
+        if ns_err is not None:
+            return (
+                False,
+                f"Archive v2 verification failure: {ns_err} for run_id '{call_run_id}'",
+            )
+        assert ns_input is not None
+
+        # Check query, ticker, date, window, and limit binding (R3, HIGH1, HIGH2)
+        call_query = call.get("query")
+        from tradingagents.dataflows.symbols import normalize_symbol
+
+        if "get_global_news" in tool_name:
+            if call_query not in ("global", "market", "macro", "all", "GLOBAL", "MARKET"):
+                return (
+                    False,
+                    f"Archive v2 verification failure: global call query mismatch '{call_query}'",
+                )
+
+            # 1. Required model-visible argument: curr_date (or as_of_date/date/asOf)
+            raw_ns_asof = (
+                ns_input.get("curr_date")
+                or ns_input.get("as_of_date")
+                or ns_input.get("date")
+                or ns_input.get("asOf")
+            )
+            if raw_ns_asof is None or str(raw_ns_asof).strip() == "":
+                return (
+                    False,
+                    f"Archive v2 verification failure: tool_start missing required date/curr_date for global news for run_id '{call_run_id}'",
+                )
+
+            # Apply native as_of date clamping
+            from tradingagents.dataflows.date_window import as_of
+
+            eff_asof_dt_str = as_of(str(raw_ns_asof).strip(), date_val)
+            if not eff_asof_dt_str:
+                return (
+                    False,
+                    f"Archive v2 verification failure: invalid as_of date '{raw_ns_asof}' in tool_start",
+                )
+            eff_asof = str(eff_asof_dt_str)[:10]
+
+            # 2. Derive effective look_back_days (model input or config default)
+            cfg = get_config()
+            ns_lb = (
+                ns_input.get("look_back_days")
+                if ns_input.get("look_back_days") is not None
+                else ns_input.get("lookback_days")
+            )
+            if ns_lb is not None:
+                eff_lb = int(ns_lb)
+            else:
+                eff_lb = int(cfg.get("global_news_lookback_days", 7))
+
+            # 3. Derive effective limit (model input or config default, preserving explicit 0)
+            ns_lim = (
+                ns_input.get("limit")
+                if ns_input.get("limit") is not None
+                else ns_input.get("article_limit")
+            )
+            if ns_lim is not None:
+                eff_lim = int(ns_lim)
+            else:
+                eff_lim = int(cfg.get("global_news_article_limit", 10))
+
+            # 4. Validate producer_params matches effective values
+            prod_asof = prod_p.get("as_of_date")
+            if not prod_asof or str(prod_asof)[:10] != eff_asof:
+                return (
+                    False,
+                    f"Archive v2 verification failure: producer_params as_of_date '{prod_asof}' does not match effective as_of_date '{eff_asof}'",
+                )
+            prod_lb = prod_p.get("look_back_days")
+            if prod_lb is not None and int(prod_lb) != eff_lb:
+                return (
+                    False,
+                    f"Archive v2 verification failure: producer_params look_back_days '{prod_lb}' does not match effective look_back_days '{eff_lb}'",
+                )
+            prod_lim = prod_p.get("limit")
+            if prod_lim is not None and int(prod_lim) != eff_lim:
+                return (
+                    False,
+                    f"Archive v2 verification failure: producer_params limit '{prod_lim}' does not match effective limit '{eff_lim}'",
+                )
+
+            # 5. Validate transport params and reject contradictions
+            curr_dt = datetime.strptime(eff_asof, "%Y-%m-%d")
+            expected_from_date = (curr_dt - timedelta(days=eff_lb)).strftime("%Y-%m-%d")
+
+            if arm == "B":
+                from tradingagents.dataflows.vendors.news_intelligence.client import to_iso_utc
+
+                expected_asof_iso = to_iso_utc(eff_asof, end_of_day=True)
+                expected_from_iso = to_iso_utc(expected_from_date, end_of_day=False)
+
+                dt_exp_asof = _parse_utc_iso(expected_asof_iso)
+                dt_exp_from = _parse_utc_iso(expected_from_iso)
+
+                if "asOf" not in params or params["asOf"] is None:
+                    return (
+                        False,
+                        "Archive v2 verification failure: transport missing required parameter 'asOf'",
+                    )
+                dt_asof = _parse_utc_iso(params["asOf"])
+                if dt_asof is None or dt_exp_asof is None or dt_asof != dt_exp_asof:
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport 'asOf' '{params['asOf']}' contradicts effective as_of_date '{eff_asof}'",
+                    )
+                if "to" not in params or params["to"] is None:
+                    return (
+                        False,
+                        "Archive v2 verification failure: transport missing required parameter 'to'",
+                    )
+                dt_to = _parse_utc_iso(params["to"])
+                if dt_to is None or dt_exp_asof is None or dt_to != dt_exp_asof:
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport 'to' '{params['to']}' contradicts effective as_of_date '{eff_asof}'",
+                    )
+                if "from" not in params or params["from"] is None:
+                    return (
+                        False,
+                        "Archive v2 verification failure: transport missing required parameter 'from'",
+                    )
+                dt_from = _parse_utc_iso(params["from"])
+                if dt_from is None or dt_exp_from is None or dt_from != dt_exp_from:
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport 'from' '{params['from']}' contradicts expected from date '{expected_from_date}'",
+                    )
+                if "limit" in params and int(params["limit"]) != eff_lim:
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport limit '{params['limit']}' contradicts effective limit '{eff_lim}'",
+                    )
+            else:
+                # Arm A (Yahoo)
+                if "as_of_date" in params or "curr_date" in params:
+                    p_asof = params.get("as_of_date") or params.get("curr_date")
+                    if str(p_asof)[:10] != eff_asof:
+                        return (
+                            False,
+                            f"Archive v2 verification failure: transport as_of_date '{p_asof}' contradicts '{eff_asof}'",
+                        )
+                if (
+                    "look_back_days" in params
+                    and params["look_back_days"] is not None
+                    and int(params["look_back_days"]) != eff_lb
+                ):
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport look_back_days '{params['look_back_days']}' contradicts '{eff_lb}'",
+                    )
+                if (
+                    "limit" in params
+                    and params["limit"] is not None
+                    and int(params["limit"]) != eff_lim
+                ):
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport limit '{params['limit']}' contradicts '{eff_lim}'",
+                    )
+
+        else:
+            # get_news
+            if not call_query or normalize_symbol(call_query) != normalize_symbol(ticker):
+                return (
+                    False,
+                    f"Archive v2 verification failure: call query '{call_query}' does not match cell ticker '{ticker}'",
+                )
+
+            # 1. Required model-visible arguments: start_date, end_date
+            raw_start = ns_input.get("start_date") or ns_input.get("from")
+            if raw_start is None or str(raw_start).strip() == "":
+                return (
+                    False,
+                    f"Archive v2 verification failure: tool_start missing required start_date for run_id '{call_run_id}'",
+                )
+            raw_end = ns_input.get("end_date") or ns_input.get("to")
+            if raw_end is None or str(raw_end).strip() == "":
+                return (
+                    False,
+                    f"Archive v2 verification failure: tool_start missing required end_date for run_id '{call_run_id}'",
+                )
+
+            # 2. Ticker handling: injected from graph state, but if model provided it, must match cell ticker
+            ns_sym = ns_input.get("ticker") or ns_input.get("symbol")
+            if (
+                ns_sym is not None
+                and str(ns_sym).strip() != ""
+                and normalize_symbol(str(ns_sym)) != normalize_symbol(ticker)
+            ):
+                return (
+                    False,
+                    f"Archive v2 verification failure: tool_start requested ticker '{ns_sym}' does not match cell ticker '{ticker}'",
+                )
+            eff_ticker = ticker
+
+            # 3. Apply native as_of_window clamping
+            from tradingagents.dataflows.date_window import as_of_window
+
+            try:
+                eff_start, eff_end = as_of_window(
+                    str(raw_start).strip(), str(raw_end).strip(), date_val
+                )
+            except ValueError as exc:
+                return (
+                    False,
+                    f"Archive v2 verification failure: invalid tool_start date window: {exc}",
+                )
+
+            # 4. Validate producer_params matches effective values
+            prod_sym = prod_p.get("ticker") or prod_p.get("symbol")
+            if not prod_sym or normalize_symbol(str(prod_sym)) != normalize_symbol(eff_ticker):
+                return (
+                    False,
+                    f"Archive v2 verification failure: producer_params ticker '{prod_sym}' does not match '{eff_ticker}'",
+                )
+            prod_start = prod_p.get("start_date")
+            if not prod_start or str(prod_start)[:10] != eff_start[:10]:
+                return (
+                    False,
+                    f"Archive v2 verification failure: producer_params start_date '{prod_start}' does not match effective start_date '{eff_start}'",
+                )
+            prod_end = prod_p.get("end_date")
+            if not prod_end or str(prod_end)[:10] != eff_end[:10]:
+                return (
+                    False,
+                    f"Archive v2 verification failure: producer_params end_date '{prod_end}' does not match effective end_date '{eff_end}'",
+                )
+
+            # Optional limit check (if present in tool_start)
+            ns_lim = (
+                ns_input.get("limit")
+                if ns_input.get("limit") is not None
+                else ns_input.get("article_limit")
+            )
+            eff_call_lim = (
+                prod_p.get("limit") if prod_p.get("limit") is not None else params.get("limit")
+            )
+            if ns_lim is not None and eff_call_lim is not None and int(ns_lim) != int(eff_call_lim):
+                return (
+                    False,
+                    f"Archive v2 verification failure: tool_start limit '{ns_lim}' does not match call limit '{eff_call_lim}'",
+                )
+
+            # 5. Validate transport params and reject contradictions
+            if arm == "B":
+                from tradingagents.dataflows.vendors.news_intelligence.client import (
+                    map_ticker_for_news_intelligence,
+                    to_iso_utc,
+                )
+
+                expected_sym, _ = map_ticker_for_news_intelligence(eff_ticker)
+                if (
+                    "symbol" in params
+                    and str(params["symbol"]) != expected_sym
+                    and normalize_symbol(str(params["symbol"])) != normalize_symbol(eff_ticker)
+                ):
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport symbol '{params['symbol']}' contradicts ticker '{eff_ticker}'",
+                    )
+                expected_from_iso = to_iso_utc(eff_start, end_of_day=False)
+                expected_to_iso = to_iso_utc(eff_end, end_of_day=True)
+
+                dt_exp_from = _parse_utc_iso(expected_from_iso)
+                dt_exp_to = _parse_utc_iso(expected_to_iso)
+
+                if "from" not in params or params["from"] is None:
+                    return (
+                        False,
+                        "Archive v2 verification failure: transport missing required parameter 'from'",
+                    )
+                dt_from = _parse_utc_iso(params["from"])
+                if dt_from is None or dt_exp_from is None or dt_from != dt_exp_from:
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport 'from' '{params['from']}' contradicts effective start_date '{eff_start}'",
+                    )
+                if "to" not in params or params["to"] is None:
+                    return (
+                        False,
+                        "Archive v2 verification failure: transport missing required parameter 'to'",
+                    )
+                dt_to = _parse_utc_iso(params["to"])
+                if dt_to is None or dt_exp_to is None or dt_to != dt_exp_to:
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport 'to' '{params['to']}' contradicts effective end_date '{eff_end}'",
+                    )
+                if "asOf" not in params or params["asOf"] is None:
+                    return (
+                        False,
+                        "Archive v2 verification failure: transport missing required parameter 'asOf'",
+                    )
+                dt_asof = _parse_utc_iso(params["asOf"])
+                if dt_asof is None or dt_exp_to is None or dt_asof != dt_exp_to:
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport 'asOf' '{params['asOf']}' contradicts effective end_date '{eff_end}'",
+                    )
+                if (
+                    "limit" in params
+                    and prod_p.get("limit") is not None
+                    and int(params["limit"]) != int(prod_p["limit"])
+                ):
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport limit '{params['limit']}' contradicts producer limit '{prod_p['limit']}'",
+                    )
+            else:
+                # Arm A (Yahoo)
+                if "ticker" in params:
+                    p_sym = params["ticker"]
+                    if normalize_symbol(str(p_sym)) != normalize_symbol(eff_ticker):
+                        return (
+                            False,
+                            f"Archive v2 verification failure: transport ticker '{p_sym}' contradicts '{eff_ticker}'",
+                        )
+                if "symbol" in params:
+                    p_sym = params["symbol"]
+                    if normalize_symbol(str(p_sym)) != normalize_symbol(eff_ticker):
+                        return (
+                            False,
+                            f"Archive v2 verification failure: transport symbol '{p_sym}' contradicts '{eff_ticker}'",
+                        )
+                if "start_date" in params:
+                    p_s = params["start_date"]
+                    if str(p_s)[:10] != eff_start[:10]:
+                        return (
+                            False,
+                            f"Archive v2 verification failure: transport start_date '{p_s}' contradicts '{eff_start}'",
+                        )
+                if "from" in params:
+                    p_s = params["from"]
+                    if str(p_s)[:10] != eff_start[:10]:
+                        return (
+                            False,
+                            f"Archive v2 verification failure: transport 'from' '{p_s}' contradicts '{eff_start}'",
+                        )
+                if "end_date" in params:
+                    p_e = params["end_date"]
+                    if str(p_e)[:10] != eff_end[:10]:
+                        return (
+                            False,
+                            f"Archive v2 verification failure: transport end_date '{p_e}' contradicts '{eff_end}'",
+                        )
+                if "to" in params:
+                    p_e = params["to"]
+                    if str(p_e)[:10] != eff_end[:10]:
+                        return (
+                            False,
+                            f"Archive v2 verification failure: transport 'to' '{p_e}' contradicts '{eff_end}'",
+                        )
+                if (
+                    "limit" in params
+                    and prod_p.get("limit") is not None
+                    and int(params["limit"]) != int(prod_p["limit"])
+                ):
+                    return (
+                        False,
+                        f"Archive v2 verification failure: transport limit '{params['limit']}' contradicts producer limit '{prod_p['limit']}'",
+                    )
+
+        # Validate declared output_hash against tool_end output_hash (R3)
+        decl_out_hash = call.get("output_hash")
+        ne_out_hash = matching_ne.get("output_hash")
+        if decl_out_hash != ne_out_hash:
+            return (
+                False,
+                f"Archive v2 verification failure: call declared output_hash does not match observed tool_end output_hash ({decl_out_hash} != {ne_out_hash})",
+            )
+
+        # Step 2: Native Normalization & Sanitization
+        if arm == "A":
+            import tradingagents.dataflows.vendors.yahoo.news as yahoo_news
+            from tradingagents.dataflows.date_window import coverage_gap, in_window
+
+            raw_articles = snap_payload if isinstance(snap_payload, list) else []
+
+            if "get_global_news" in tool_name:
+                as_of_date = prod_p.get("as_of_date") or params.get("as_of_date") or date_val
+                cfg = get_config()
+                eff_lb = (
+                    prod_p.get("look_back_days")
+                    if prod_p.get("look_back_days") is not None
+                    else params.get("look_back_days")
+                )
+                if eff_lb is None:
+                    eff_lb = cfg.get("global_news_lookback_days", 7)
+                eff_lim = (
+                    prod_p.get("limit") if prod_p.get("limit") is not None else params.get("limit")
+                )
+                if eff_lim is None:
+                    eff_lim = cfg.get("global_news_article_limit", 10)
+
+                curr_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
+                start_dt = curr_dt - relativedelta(days=eff_lb)
+                start_date = start_dt.strftime("%Y-%m-%d")
+
+                in_window_news = []
+                seen_titles: set[str] = set()
+                for article in raw_articles:
+                    data_art = yahoo_news._extract_article_data(article)
+                    if not in_window(data_art["pub_date"], start_dt, curr_dt):
+                        continue
+                    if data_art["title"] and data_art["title"] not in seen_titles:
+                        seen_titles.add(data_art["title"])
+                        in_window_news.append(data_art)
+
+                derived_records = in_window_news[:eff_lim]
+
+                # Step 3: Arm A Field-by-field equality check
+                if len(stored_records) != len(derived_records):
+                    return (
+                        False,
+                        f"Archive v2 verification failure: Arm A stored records count ({len(stored_records)}) != derived records count ({len(derived_records)})",
+                    )
+
+                for s_rec, d_rec in zip(stored_records, derived_records, strict=True):
+                    for k_f in ("title", "summary", "publisher", "link"):
+                        if s_rec.get(k_f) != d_rec.get(k_f):
+                            return (
+                                False,
+                                f"Archive v2 verification failure: Arm A field mismatch on '{k_f}': {s_rec.get(k_f)!r} != {d_rec.get(k_f)!r}",
+                            )
+                    d_pd = d_rec.get("pub_date")
+                    d_pd_str = d_pd.isoformat() if isinstance(d_pd, datetime) else d_pd
+                    s_pd = s_rec.get("pub_date")
+                    if s_pd != d_pd_str:
+                        dt_s = _parse_utc_iso(str(s_pd)) if s_pd else None
+                        dt_d = _parse_utc_iso(str(d_pd_str)) if d_pd_str else None
+                        if dt_s != dt_d:
+                            return (
+                                False,
+                                f"Archive v2 verification failure: Arm A pub_date mismatch: {s_pd!r} != {d_pd_str!r}",
+                            )
+
+                # Step 4: Producer Output Reconstruction
+                news_str = yahoo_news._format_articles(derived_records)
+                if not news_str:
+                    gap = coverage_gap(
+                        (), start_date, as_of_date, "Yahoo Finance global news", "market news"
+                    )
+                    candidate_text = (
+                        gap or f"No global news found between {start_date} and {as_of_date}"
+                    )
+                else:
+                    candidate_text = (
+                        f"## Global Market News, from {start_date} to {as_of_date}:\n\n{news_str}"
+                    )
+
+            else:
+                # get_news
+                req_ticker = prod_p.get("ticker") or params.get("ticker") or ticker
+                start_date = prod_p.get("start_date") or params.get("start_date") or date_val
+                end_date = prod_p.get("end_date") or params.get("end_date") or date_val
+
+                canonical = normalize_symbol(req_ticker)
+                resolved = "" if canonical == req_ticker else f" (resolved to {canonical})"
+                subject = f"news for {req_ticker}{resolved}"
+
+                articles = [yahoo_news._extract_article_data(a) for a in raw_articles]
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                in_range = [a for a in articles if in_window(a["pub_date"], start_dt, end_dt)]
+                derived_records = in_range
+
+                # Step 3: Arm A Field-by-field equality check
+                if len(stored_records) != len(derived_records):
+                    return (
+                        False,
+                        f"Archive v2 verification failure: Arm A stored records count ({len(stored_records)}) != derived records count ({len(derived_records)})",
+                    )
+
+                for s_rec, d_rec in zip(stored_records, derived_records, strict=True):
+                    for k_f in ("title", "summary", "publisher", "link"):
+                        if s_rec.get(k_f) != d_rec.get(k_f):
+                            return (
+                                False,
+                                f"Archive v2 verification failure: Arm A field mismatch on '{k_f}': {s_rec.get(k_f)!r} != {d_rec.get(k_f)!r}",
+                            )
+                    d_pd = d_rec.get("pub_date")
+                    d_pd_str = d_pd.isoformat() if isinstance(d_pd, datetime) else d_pd
+                    s_pd = s_rec.get("pub_date")
+                    if s_pd != d_pd_str:
+                        dt_s = _parse_utc_iso(str(s_pd)) if s_pd else None
+                        dt_d = _parse_utc_iso(str(d_pd_str)) if d_pd_str else None
+                        if dt_s != dt_d:
+                            return (
+                                False,
+                                f"Archive v2 verification failure: Arm A pub_date mismatch: {s_pd!r} != {d_pd_str!r}",
+                            )
+
+                # Step 4: Producer Output Reconstruction (R5: Yahoo search fallback sentinel)
+                if in_range:
+                    candidate_text = f"## {req_ticker}{resolved} News, from {start_date} to {end_date}:\n\n{yahoo_news._format_articles(in_range)}"
+                else:
+                    feed_src = call.get("feed_source")
+                    if feed_src == "search":
+                        candidate_text = (
+                            f"<Yahoo Finance news unavailable for {start_date}..{end_date}: Yahoo search "
+                            f"returns only a sample of recent articles about {canonical}, so this is not "
+                            f"an absence of {subject}>"
+                        )
+                    else:
+                        gap = coverage_gap(
+                            (a["pub_date"] for a in articles),
+                            start_date,
+                            end_date,
+                            "Yahoo Finance news",
+                            subject,
+                        )
+                        candidate_text = (
+                            gap
+                            or f"No news found for {req_ticker}{resolved} between {start_date} and {end_date}"
+                        )
+
+        elif arm == "B":
+            import tradingagents.dataflows.vendors.news_intelligence.client as ni_client
+
+            raw_events = snap_payload.get("events") if isinstance(snap_payload, dict) else []
+
+            if "get_global_news" in tool_name:
+                cfg = get_config()
+                as_of_date = prod_p.get("as_of_date")
+                if not as_of_date and "asOf" in params:
+                    as_of_date = str(params["asOf"])[:10]
+                if not as_of_date:
+                    as_of_date = params.get("as_of_date") or date_val
+
+                eff_lb = prod_p.get("look_back_days")
+                if eff_lb is None and "from" in params and "asOf" in params:
+                    dt_from = _parse_utc_iso(str(params["from"]))
+                    dt_asof = _parse_utc_iso(str(params["asOf"]))
+                    if dt_from and dt_asof:
+                        eff_lb = (dt_asof.date() - dt_from.date()).days
+                if eff_lb is None and "from" in params and as_of_date:
+                    dt_from = _parse_utc_iso(str(params["from"]))
+                    dt_curr = datetime.strptime(as_of_date, "%Y-%m-%d").replace(tzinfo=UTC)
+                    if dt_from:
+                        eff_lb = (dt_curr.date() - dt_from.date()).days
+                if eff_lb is None:
+                    eff_lb = params.get("look_back_days")
+                if eff_lb is None:
+                    eff_lb = cfg.get("global_news_lookback_days", 7)
+
+                eff_lim = (
+                    prod_p.get("limit") if prod_p.get("limit") is not None else params.get("limit")
+                )
+                if eff_lim is None:
+                    eff_lim = cfg.get("global_news_article_limit", 10)
+
+                curr_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
+                start_dt = curr_dt - timedelta(days=eff_lb)
+                start_date = start_dt.strftime("%Y-%m-%d")
+
+                as_of = ni_client.to_iso_utc(as_of_date, end_of_day=True)
+                min_pub = ni_client.to_iso_utc(start_date, end_of_day=False)
+                max_pub = ni_client.to_iso_utc(as_of_date, end_of_day=True)
+                cutoff_dt = ni_client.parse_utc_timestamp(as_of)
+                min_pub_dt = ni_client.parse_utc_timestamp(min_pub)
+                max_pub_dt = ni_client.parse_utc_timestamp(max_pub)
+
+                sanitized_events = []
+                for raw_event in raw_events:
+                    if not ni_client.validate_canonical_event(raw_event):
+                        continue
+                    ev = ni_client.filter_and_sanitize_event(
+                        raw_event,
+                        cutoff_dt=cutoff_dt,
+                        min_pub_dt=min_pub_dt,
+                        max_pub_dt=max_pub_dt,
+                    )
+                    if ev is not None:
+                        sanitized_events.append(ev)
+
+                derived_records = sanitized_events[:eff_lim]
+
+                # Step 3: Arm B Field-by-field equality check
+                if len(stored_records) != len(derived_records):
+                    return (
+                        False,
+                        f"Archive v2 verification failure: Arm B stored records count ({len(stored_records)}) != derived records count ({len(derived_records)})",
+                    )
+
+                for s_rec, d_rec in zip(stored_records, derived_records, strict=True):
+                    for k_f in ("id", "publishedAt", "receivedAt", "enrichedAt", "symbols"):
+                        if s_rec.get(k_f) != d_rec.get(k_f):
+                            return (
+                                False,
+                                f"Archive v2 verification failure: Arm B canonical field mismatch on '{k_f}': {s_rec.get(k_f)!r} != {d_rec.get(k_f)!r}",
+                            )
+
+                # Step 4: Producer Output Reconstruction
+                if sanitized_events:
+                    formatted = "\n".join(
+                        ni_client.format_article(e) for e in sanitized_events[:eff_lim]
+                    )
+                    candidate_text = (
+                        f"## Global Market News, from {start_date} to {as_of_date}:\n\n{formatted}"
+                    )
+                else:
+                    candidate_text = f"No global news found between {start_date} and {as_of_date}"
+
+            else:
+                # get_news
+                cfg = get_config()
+                req_ticker = (
+                    prod_p.get("ticker") or params.get("ticker") or params.get("symbol") or ticker
+                )
+                start_date = prod_p.get("start_date")
+                if not start_date and "from" in params:
+                    start_date = str(params["from"])[:10]
+                if not start_date:
+                    start_date = params.get("start_date") or date_val
+
+                end_date = prod_p.get("end_date")
+                if not end_date and "to" in params:
+                    end_date = str(params["to"])[:10]
+                elif not end_date and "asOf" in params:
+                    end_date = str(params["asOf"])[:10]
+                if not end_date:
+                    end_date = params.get("end_date") or date_val
+
+                query_symbol, resolved = ni_client.map_ticker_for_news_intelligence(req_ticker)
+                limit = (
+                    prod_p.get("limit") if prod_p.get("limit") is not None else params.get("limit")
+                )
+                if limit is None:
+                    limit = cfg.get("news_article_limit", 20)
+
+                as_of = ni_client.to_iso_utc(end_date, end_of_day=True)
+                min_pub = ni_client.to_iso_utc(start_date, end_of_day=False)
+                max_pub = ni_client.to_iso_utc(end_date, end_of_day=True)
+                cutoff_dt = ni_client.parse_utc_timestamp(as_of)
+                min_pub_dt = ni_client.parse_utc_timestamp(min_pub)
+                max_pub_dt = ni_client.parse_utc_timestamp(max_pub)
+
+                sanitized_events = []
+                for raw_event in raw_events:
+                    if not ni_client.validate_canonical_event(raw_event):
+                        continue
+                    ev = ni_client.filter_and_sanitize_event(
+                        raw_event,
+                        cutoff_dt=cutoff_dt,
+                        min_pub_dt=min_pub_dt,
+                        max_pub_dt=max_pub_dt,
+                    )
+                    if ev is not None and query_symbol in ev.get("symbols", []):
+                        sanitized_events.append(ev)
+
+                derived_records = sanitized_events[:limit]
+
+                # Step 3: Arm B Field-by-field equality check
+                if len(stored_records) != len(derived_records):
+                    return (
+                        False,
+                        f"Archive v2 verification failure: Arm B stored records count ({len(stored_records)}) != derived records count ({len(derived_records)})",
+                    )
+
+                for s_rec, d_rec in zip(stored_records, derived_records, strict=True):
+                    for k_f in ("id", "publishedAt", "receivedAt", "enrichedAt", "symbols"):
+                        if s_rec.get(k_f) != d_rec.get(k_f):
+                            return (
+                                False,
+                                f"Archive v2 verification failure: Arm B canonical field mismatch on '{k_f}': {s_rec.get(k_f)!r} != {d_rec.get(k_f)!r}",
+                            )
+
+                # Step 4: Producer Output Reconstruction
+                if sanitized_events:
+                    formatted = "\n".join(
+                        ni_client.format_article(e) for e in sanitized_events[:limit]
+                    )
+                    candidate_text = f"## {req_ticker}{resolved} News, from {start_date} to {end_date}:\n\n{formatted}"
+                else:
+                    candidate_text = f"No news found for {req_ticker}{resolved} between {start_date} and {end_date}"
+
+        candidate_hash = hashlib.sha256(candidate_text.encode("utf-8")).hexdigest()
+
+        # Step 5: Exact Comparison Against Observed Consumed Tool Output in audit_trace
+        if ne_out_hash != candidate_hash:
+            return (
+                False,
+                f"Archive v2 verification failure: derived candidate hash mismatch ({candidate_hash} != {ne_out_hash})",
+            )
+
+        ne_out = matching_ne.get("output")
+        if (
+            ne_out is not None
+            and str(ne_out) != candidate_text
+            and sanitize_text(candidate_text) != str(ne_out)
+        ):
+            return (
+                False,
+                "Archive v2 verification failure: derived candidate output text does not match observed tool output",
+            )
+
+        bound_run_ids.add(call_run_id)
+
+    if len(bound_run_ids) != len(news_ends):
+        return (
+            False,
+            f"Archive v2 verification failure: only {len(bound_run_ids)} of {len(news_ends)} observed tool executions were bound",
+        )
+
+    return True, f"Verified authentic evidence for Arm {arm}"
+
+
 def _verify_archive_for_arm(
     fpath: Path,
     arm: str,
@@ -2059,10 +3807,9 @@ def _verify_archive_for_arm(
     if dt_cutoff is None:
         return False, "Archive verification requires explicit, valid entry cutoff"
 
-    try:
-        data = json.loads(fpath.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return False, f"Invalid JSON ({exc})"
+    data, err = _read_bounded_json_envelope(fpath)
+    if err is not None:
+        return False, f"Archive verification failure: {err}"
 
     if not data or not isinstance(data, (dict, list)):
         return False, "Archive JSON must be a non-empty dictionary or list"
@@ -2092,6 +3839,24 @@ def _verify_archive_for_arm(
     ]
     if not news_ends:
         return False, f"Audit trace contains no observed news tool executions for Arm {arm}"
+
+    # Version dispatch: t13-archive/v2 requires unbroken derivation verification; never falls back to legacy
+    if isinstance(data, dict) and data.get("version") == "t13-archive/v2":
+        try:
+            return _verify_v2_archive(
+                data=data,
+                fpath=fpath,
+                arm=arm,
+                ticker=ticker,
+                date_val=date_val,
+                dt_cutoff=dt_cutoff,
+                decision_att=decision_att,
+                cell_dir=cell_dir,
+                news_ends=news_ends,
+                tr_data=tr_data,
+            )
+        except Exception as exc:
+            return False, f"Archive v2 verification failure: {exc}"
 
     has_global_news = any("get_global_news" in str(t.get("tool", "")) for t in news_ends)
     has_asset_news = any(
@@ -3188,6 +4953,27 @@ def _verify_provenance_archive_file(
     return ok_A or ok_B
 
 
+def validate_evidence_archive(
+    fpath: Path | str,
+    arm: str,
+    ticker: str,
+    date_val: str,
+    dt_cutoff: datetime | None,
+    decision_att: dict[str, Any],
+    cell_dir: Path | str,
+) -> tuple[bool, str]:
+    """Public helper to validate an authentic evidence archive for an arm."""
+    return _verify_archive_for_arm(
+        Path(fpath),
+        arm,
+        ticker,
+        date_val,
+        dt_cutoff,
+        decision_att,
+        Path(cell_dir),
+    )
+
+
 def _get_market_tz(ticker: str | None) -> ZoneInfo:
     """Return exchange market timezone for an asset to distinguish daily-bar labels from availability clocks."""
     if not ticker:
@@ -3473,7 +5259,7 @@ def _validate_archive_evidence(
     # R2: If entry cutoff is missing or invalid, archive evidence validation fails closed
     if dt_cutoff is None:
         reasons.append("Archive evidence validation blocked: missing or invalid entry cutoff")
-        return False, False, reasons
+        return False, False, reasons, False
 
     dt_cutoff_val = dt_cutoff
 
@@ -3520,9 +5306,16 @@ def _validate_archive_evidence(
     if not verified_B:
         reasons.append(f"Arm B (Repo 1 News Intelligence): {reason_B}")
 
+    has_v2 = False
+    for f in files_A + files_B:
+        c_data, err = _read_bounded_json_envelope(f)
+        if err is None and isinstance(c_data, dict) and c_data.get("version") == "t13-archive/v2":
+            has_v2 = True
+            break
+
     provenance_verified = bool(verified_A and verified_B)
 
-    return provenance_verified, timing_eligible, reasons
+    return provenance_verified, timing_eligible, reasons, has_v2
 
 
 def _write_entries_to_log(path: Path, entries: list[dict[str, Any]]) -> None:
@@ -3659,6 +5452,9 @@ def summarize_experiment(output_dir: Path | str) -> dict[str, Any]:
             "native_logs_present": False,
             "provenance_verified": False,
             "timing_eligible": False,
+            "diagnostic_eligible": False,
+            "diagnostic_provenance_verified": False,
+            "diagnostic_timing_eligible": False,
             "non_news_inputs_equal": False,
             "price_vintage_equal": False,
             "benchmark_vintage_equal": False,
@@ -3789,7 +5585,7 @@ def summarize_experiment(output_dir: Path | str) -> dict[str, Any]:
             continue
 
         # R1: Timing & Provenance eligibility verification via authentic immutable archive validation
-        prov_ok, timing_ok, archive_reasons = _validate_archive_evidence(
+        prov_ok, timing_ok, archive_reasons, is_v2 = _validate_archive_evidence(
             output_root,
             ticker_val,
             date_val,
@@ -3800,8 +5596,13 @@ def summarize_experiment(output_dir: Path | str) -> dict[str, Any]:
             sA,
             sB,
         )
-        elig_rec["provenance_verified"] = prov_ok
-        elig_rec["timing_eligible"] = timing_ok
+        elig_rec["diagnostic_provenance_verified"] = prov_ok
+        elig_rec["diagnostic_timing_eligible"] = timing_ok
+        elig_rec["provenance_verified"] = False
+        elig_rec["timing_eligible"] = False
+        elig_rec["is_v2"] = is_v2
+        if is_v2:
+            elig_rec["archive_version"] = "t13-archive/v2"
         if archive_reasons:
             elig_rec["ineligibility_reasons"].extend(archive_reasons)
 
@@ -3917,14 +5718,15 @@ def summarize_experiment(output_dir: Path | str) -> dict[str, Any]:
         is_pair_strictly_eligible = bool(
             elig_rec["decision_verified"]
             and elig_rec["native_logs_present"]
-            and elig_rec["timing_eligible"]
-            and elig_rec["provenance_verified"]
+            and elig_rec["diagnostic_timing_eligible"]
+            and elig_rec["diagnostic_provenance_verified"]
             and elig_rec["non_news_inputs_equal"]
             and elig_rec["price_vintage_equal"]
             and elig_rec["benchmark_vintage_equal"]
             and native_evidence_available
         )
-        elig_rec["eligible"] = is_pair_strictly_eligible
+        elig_rec["diagnostic_eligible"] = is_pair_strictly_eligible
+        elig_rec["eligible"] = False
         if not is_pair_strictly_eligible:
             unmatched_vintages_count += 1
             continue
@@ -3980,7 +5782,6 @@ def summarize_experiment(output_dir: Path | str) -> dict[str, Any]:
 
     hit_rate_A = round(hits_A / directional_count_A, 3) if directional_count_A > 0 else None
     hit_rate_B = round(hits_B / directional_count_B, 3) if directional_count_B > 0 else None
-
     summary: dict[str, Any] = {
         "manifest_hash": journal.get("manifest_hash"),
         "experiment_id": journal.get("experiment_id"),
@@ -4000,25 +5801,19 @@ def summarize_experiment(output_dir: Path | str) -> dict[str, Any]:
         "pending_window_settlements_count": len(pending_window_settlements),
         "orphaned_settlements_count": orphaned_settlements_count,
         "unmatched_vintages_count": unmatched_vintages_count,
-        "settled_pairs_count": len(eligible_matched_keys),
-        "scored_pairs_count": len(scored_keys),
+        "settled_pairs_count": 0,
+        "scored_pairs_count": 0,
         "unscored_pairs_count": unscored_count,
-        "ineligible_pairs_count": max(0, planned_pairs_count - len(eligible_matched_keys)),
-        "provenance_verified": all(
-            pair_eligibility[k]["provenance_verified"] for k in eligible_matched_keys
-        )
-        if eligible_matched_keys
-        else False,
-        "timing_eligible": all(
-            pair_eligibility[k]["timing_eligible"] for k in eligible_matched_keys
-        )
-        if eligible_matched_keys
-        else False,
-        "non_news_inputs_equal": all(
-            pair_eligibility[k]["non_news_inputs_equal"] for k in eligible_matched_keys
-        )
-        if eligible_matched_keys
-        else False,
+        "ineligible_pairs_count": planned_pairs_count,
+        "strict_empirical_eligible": False,
+        "availability_status": "availability_unknown",
+        "provenance_verified": False,
+        "timing_eligible": False,
+        "non_news_inputs_equal": (
+            all(pair_eligibility[k]["non_news_inputs_equal"] for k in eligible_matched_keys)
+            if eligible_matched_keys
+            else False
+        ),
         "eligibility_fields": [
             "provenance_verified",
             "timing_eligible",
@@ -4027,15 +5822,29 @@ def summarize_experiment(output_dir: Path | str) -> dict[str, Any]:
             "benchmark_vintage_equal",
         ],
         "pair_eligibility": pair_eligibility,
-        "mean_alpha_A": mean_alpha_A,
-        "mean_alpha_B": mean_alpha_B,
-        "alpha_difference": alpha_diff,
-        "directional_hits_A": hits_A,
-        "directional_count_A": directional_count_A,
-        "directional_hit_rate_A": hit_rate_A,
-        "directional_hits_B": hits_B,
-        "directional_count_B": directional_count_B,
-        "directional_hit_rate_B": hit_rate_B,
+        "mean_alpha_A": None,
+        "mean_alpha_B": None,
+        "alpha_difference": None,
+        "directional_hits_A": 0,
+        "directional_count_A": 0,
+        "directional_hit_rate_A": None,
+        "directional_hits_B": 0,
+        "directional_count_B": 0,
+        "directional_hit_rate_B": None,
+        "diagnostic_summary": {
+            "diagnostic_scored_pairs_count": len(scored_keys),
+            "diagnostic_settled_pairs_count": len(eligible_matched_keys),
+            "diagnostic_mean_alpha_A": mean_alpha_A,
+            "diagnostic_mean_alpha_B": mean_alpha_B,
+            "diagnostic_alpha_difference": alpha_diff,
+            "diagnostic_directional_hits_A": hits_A,
+            "diagnostic_directional_count_A": directional_count_A,
+            "diagnostic_directional_hit_rate_A": hit_rate_A,
+            "diagnostic_directional_hits_B": hits_B,
+            "diagnostic_directional_count_B": directional_count_B,
+            "diagnostic_directional_hit_rate_B": hit_rate_B,
+            "diagnostic_status": "NON_EMPIRICAL_DIAGNOSTIC_ONLY",
+        },
         "native_summary_A": {
             "resolved": native_summary_A.resolved,
             "pending": native_summary_A.pending,

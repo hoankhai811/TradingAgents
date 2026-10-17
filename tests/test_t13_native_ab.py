@@ -14,9 +14,12 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Annotated, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,17 +27,24 @@ from langchain_core.language_models.fake_chat_models import (
     FakeListChatModel,
     FakeMessagesListChatModel,
 )
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
+from langgraph.graph import add_messages
 from pydantic import BaseModel
 
+import experiments.t13_native_ab as r
+import tradingagents.dataflows.vendors.news_intelligence.client as news_client
+import tradingagents.dataflows.vendors.yahoo.news as yahoo_news
 from experiments.t13_native_ab import (
     AuditCallbackHandler,
+    EvidenceStorageError,
     JournalPersistenceError,
     JournalVerificationError,
     ManifestMismatchError,
     OwnershipError,
+    ProspectiveCaptureContext,
     _build_arm_config,
+    _current_tool_run_id,
     _persist_journal,
     acquire_experiment_owner,
     compute_manifest_hash,
@@ -43,14 +53,18 @@ from experiments.t13_native_ab import (
     sanitize_text,
     settle_experiment,
     summarize_experiment,
+    validate_evidence_archive,
     validate_manifest,
 )
+from tradingagents.agents import tools as native_tools
 from tradingagents.agents.rating import RATING_REVIEW
 from tradingagents.dataflows.router import get_vendor
 from tradingagents.llm_clients.factory import create_tier_client, tier_provider
 from tradingagents.memory.log import TradingMemoryLog
 from tradingagents.memory.settlement import Settlement
 from tradingagents.portfolio import PortfolioContext
+
+ni_client = news_client
 
 
 class NetworkAccessAttemptedError(BaseException):
@@ -1423,15 +1437,25 @@ def test_r7_summarize_excludes_unmatched_vintages_and_orphaned_settlements(tmp_p
 
     summary = summarize_experiment(out)
 
-    # Only Pair 1 is eligible!
-    assert summary["settled_pairs_count"] == 1
+    # Only Pair 1 is eligible (tracked diagnostically under strict public zero/unknown contract)
+    assert summary["settled_pairs_count"] == 0
+    assert summary["scored_pairs_count"] == 0
+    assert summary["strict_empirical_eligible"] is False
+    assert summary["availability_status"] == "availability_unknown"
+    assert summary["mean_alpha_A"] is None
+    assert summary["mean_alpha_B"] is None
+    assert summary["alpha_difference"] is None
     assert (
         summary["unmatched_vintages_count"] == 1
     )  # AAPL rejected due to different resolution dates
     assert summary["orphaned_settlements_count"] >= 1  # ORPHAN rejected
-    assert summary["mean_alpha_A"] == 0.030
-    assert summary["mean_alpha_B"] == 0.030
-    assert summary["alpha_difference"] == 0.000
+
+    diag = summary["diagnostic_summary"]
+    assert diag["diagnostic_settled_pairs_count"] == 1
+    assert diag["diagnostic_scored_pairs_count"] == 1
+    assert diag["diagnostic_mean_alpha_A"] == 0.030
+    assert diag["diagnostic_mean_alpha_B"] == 0.030
+    assert diag["diagnostic_alpha_difference"] == 0.000
 
 
 def test_r7_summarize_excludes_review_and_preserves_hold_semantics(tmp_path: Path) -> None:
@@ -1699,25 +1723,35 @@ def test_r7_summarize_excludes_review_and_preserves_hold_semantics(tmp_path: Pat
 
     summary = summarize_experiment(out)
 
-    assert summary["settled_pairs_count"] == 2
-    assert (
-        summary["scored_pairs_count"] == 1
-    )  # Only Pair 2 is scored; Pair 1 is unscored due to REVIEW
+    assert summary["settled_pairs_count"] == 0
+    assert summary["scored_pairs_count"] == 0
     assert summary["unscored_pairs_count"] == 1
-
-    # Mean alphas only include the scored pair (BTC-USD: -0.010)
-    assert summary["mean_alpha_A"] == -0.010
-    assert summary["mean_alpha_B"] == -0.010
-    assert summary["alpha_difference"] == 0.0
-
-    # Hold has direction 0 -> zero directional count and zero hits
+    assert summary["strict_empirical_eligible"] is False
+    assert summary["availability_status"] == "availability_unknown"
+    assert summary["mean_alpha_A"] is None
+    assert summary["mean_alpha_B"] is None
+    assert summary["alpha_difference"] is None
     assert summary["directional_count_A"] == 0
     assert summary["directional_hits_A"] == 0
     assert summary["directional_hit_rate_A"] is None
-
     assert summary["directional_count_B"] == 0
     assert summary["directional_hits_B"] == 0
     assert summary["directional_hit_rate_B"] is None
+
+    diag = summary["diagnostic_summary"]
+    assert diag["diagnostic_settled_pairs_count"] == 2
+    assert (
+        diag["diagnostic_scored_pairs_count"] == 1
+    )  # Only Pair 2 is scored; Pair 1 is unscored due to REVIEW
+    assert diag["diagnostic_mean_alpha_A"] == -0.010
+    assert diag["diagnostic_mean_alpha_B"] == -0.010
+    assert diag["diagnostic_alpha_difference"] == 0.0
+    assert diag["diagnostic_directional_count_A"] == 0
+    assert diag["diagnostic_directional_hits_A"] == 0
+    assert diag["diagnostic_directional_hit_rate_A"] is None
+    assert diag["diagnostic_directional_count_B"] == 0
+    assert diag["diagnostic_directional_hits_B"] == 0
+    assert diag["diagnostic_directional_hit_rate_B"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -3555,9 +3589,15 @@ def test_r4_positive_archive_evidence_passes(
     )
 
     summary = summarize_experiment(out)
-    assert summary["scored_pairs_count"] == 1
-    assert summary["provenance_verified"] is True
-    assert summary["timing_eligible"] is True
+    assert summary["scored_pairs_count"] == 0
+    assert summary["provenance_verified"] is False
+    assert summary["timing_eligible"] is False
+    assert summary["strict_empirical_eligible"] is False
+    assert summary["availability_status"] == "availability_unknown"
+    assert summary["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert summary["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert summary["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
+    assert summary["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_eligible"] is True
 
 
 def test_r4_holding_window_native_contradiction_rejected(
@@ -4331,9 +4371,15 @@ def test_r5_normal_in_run_callback_traces_pass_timing_gate(
     )
 
     summary = summarize_experiment(out)
-    assert summary["timing_eligible"] is True
-    assert summary["provenance_verified"] is True
-    assert summary["scored_pairs_count"] == 1
+    assert summary["timing_eligible"] is False
+    assert summary["provenance_verified"] is False
+    assert summary["scored_pairs_count"] == 0
+    assert summary["strict_empirical_eligible"] is False
+    assert summary["availability_status"] == "availability_unknown"
+    assert summary["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert summary["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
+    assert summary["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert summary["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_eligible"] is True
 
 
 def test_r5_native_settlement_crash_before_reflection_retains_unknown_usage(
@@ -5435,17 +5481,22 @@ def test_r7_proving_r1_declared_hash_and_payload_digest_binding(
     # 1. Fully bound positive capture: passes strict scoring
     write_archives(base_A, base_B)
     s = summarize_experiment(out)
-    assert s["scored_pairs_count"] == 1
-    assert s["timing_eligible"] is True
-    assert s["provenance_verified"] is True
+    assert s["scored_pairs_count"] == 0
+    assert s["timing_eligible"] is False
+    assert s["provenance_verified"] is False
+    assert s["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
+    assert s["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
 
     # 2. Both supported JSON shapes: list shape for both arms also passes
     list_A = [copy.deepcopy(base_A)]
     list_B = [copy.deepcopy(base_B)]
     write_archives(list_A, list_B)
     s = summarize_experiment(out)
-    assert s["scored_pairs_count"] == 1
-    assert s["provenance_verified"] is True
+    assert s["scored_pairs_count"] == 0
+    assert s["provenance_verified"] is False
+    assert s["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
 
     # 3. Mutate retained contents while preserving declared hash: MUST FAIL CLOSED
     # Arm A tampered:
@@ -5531,8 +5582,10 @@ def test_r7_proving_r1_declared_hash_and_payload_digest_binding(
     # Restore audit trace and verify recovery
     p_trace_A.write_bytes(valid_trace_bytes)
     s = summarize_experiment(out)
-    assert s["scored_pairs_count"] == 1
-    assert s["provenance_verified"] is True
+    assert s["scored_pairs_count"] == 0
+    assert s["provenance_verified"] is False
+    assert s["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
 
 
 def test_r7_proving_r2_entry_evidence_and_timing_gate(
@@ -6024,18 +6077,24 @@ def test_r8_proving_r1_consumed_event_clock_and_request_binding(
     # 1. Baseline: Fully linked matching capture passes
     write_archives(base_A, base_B)
     s1 = summarize_experiment(out)
-    assert s1["scored_pairs_count"] == 1
-    assert s1["provenance_verified"] is True
-    assert s1["timing_eligible"] is True
+    assert s1["scored_pairs_count"] == 0
+    assert s1["provenance_verified"] is False
+    assert s1["timing_eligible"] is False
+    assert s1["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s1["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert s1["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # 2. List archive shape: Fully linked matching capture passes
     list_A = [dict(base_A)]
     list_B = [dict(base_B)]
     write_archives(list_A, list_B)
     s2 = summarize_experiment(out)
-    assert s2["scored_pairs_count"] == 1
-    assert s2["provenance_verified"] is True
-    assert s2["timing_eligible"] is True
+    assert s2["scored_pairs_count"] == 0
+    assert s2["provenance_verified"] is False
+    assert s2["timing_eligible"] is False
+    assert s2["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s2["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert s2["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # 3. Reviewer Reproduction 1: Retain legitimate response for late event + unrelated early records
     # Synthetic event published at 21:00Z, received at 21:01Z, enriched at 21:02Z
@@ -6434,8 +6493,10 @@ def test_r8_proving_r2_invalid_entry_evidence_and_midnight_spelling(
     # 1. Positive baseline test passes
     (out / "journal.json").write_text(json.dumps(copy.deepcopy(base_journal)), encoding="utf-8")
     s_pos = summarize_experiment(out)
-    assert s_pos["timing_eligible"] is True
-    assert s_pos["scored_pairs_count"] == 1
+    assert s_pos["timing_eligible"] is False
+    assert s_pos["scored_pairs_count"] == 0
+    assert s_pos["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s_pos["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # 2. Defect cases for invalid entry evidence / daily-bar labels
     defect_cases = [
@@ -6718,9 +6779,12 @@ def test_r9_proving_r1_nested_payload_and_request_binding(
 
     # 1. Baseline: positive fully bound capture passes
     s_pos = summarize_experiment(out)
-    assert s_pos["scored_pairs_count"] == 1
-    assert s_pos["provenance_verified"] is True
-    assert s_pos["timing_eligible"] is True
+    assert s_pos["scored_pairs_count"] == 0
+    assert s_pos["provenance_verified"] is False
+    assert s_pos["timing_eligible"] is False
+    assert s_pos["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s_pos["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert s_pos["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # 2. Moving late response string into each admitted record field: MUST FAIL CLOSED
     # Synthetic late event after entry cutoff (20:00Z)
@@ -7150,12 +7214,18 @@ def test_r9_proving_r2_market_timezone_daily_bar_and_offset_invariance(
     s_offset = summarize_experiment(out_offset)
 
     # Invariance verification: both spellings produce identical eligibility and scored pairs!
-    assert s_utc["timing_eligible"] is True
-    assert s_offset["timing_eligible"] is True
-    assert s_utc["scored_pairs_count"] == 1
-    assert s_offset["scored_pairs_count"] == 1
-    assert s_utc["provenance_verified"] is True
-    assert s_offset["provenance_verified"] is True
+    assert s_utc["timing_eligible"] is False
+    assert s_offset["timing_eligible"] is False
+    assert s_utc["scored_pairs_count"] == 0
+    assert s_offset["scored_pairs_count"] == 0
+    assert s_utc["provenance_verified"] is False
+    assert s_offset["provenance_verified"] is False
+    assert s_utc["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s_offset["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s_utc["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
+    assert s_offset["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
+    assert s_utc["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert s_offset["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
 
     # --- Part 2: Market Exchange Daily-Bar Midnight Fails Closed Under Both Spellings ---
     # 2a. Tokyo exchange (7203.T): 00:00:00+09:00 and 15:00:00Z are equivalent daily-bar labels
@@ -7427,9 +7497,12 @@ def test_r10_proving_r1_canonical_clock_conflict_and_enrichment_withholding(
     }
     write_setup(event_early_enr)
     s_early = summarize_experiment(out)
-    assert s_early["scored_pairs_count"] == 1
-    assert s_early["provenance_verified"] is True
-    assert s_early["timing_eligible"] is True
+    assert s_early["scored_pairs_count"] == 0
+    assert s_early["provenance_verified"] is False
+    assert s_early["timing_eligible"] is False
+    assert s_early["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s_early["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert s_early["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # 2. Earlier conflicting aliases fail closed (none may override late canonical availability)
     # 2a. Earlier published_at vs late canonical publishedAt
@@ -7512,9 +7585,12 @@ def test_r10_proving_r1_canonical_clock_conflict_and_enrichment_withholding(
     }
     write_setup(event_plain)
     s_plain = summarize_experiment(out)
-    assert s_plain["scored_pairs_count"] == 1
-    assert s_plain["provenance_verified"] is True
-    assert s_plain["timing_eligible"] is True
+    assert s_plain["scored_pairs_count"] == 0
+    assert s_plain["provenance_verified"] is False
+    assert s_plain["timing_eligible"] is False
+    assert s_plain["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s_plain["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert s_plain["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
 
 def test_r10_proving_r2_article_publisher_vs_routing_vendor(
@@ -7716,23 +7792,36 @@ def test_r10_proving_r2_article_publisher_vs_routing_vendor(
     # 1a. Reviewer counterexample: 'REVIEWER_ONLY publisher' with routing vendor 'repo1'
     write_experiment("REVIEWER_ONLY publisher", arm_b_vendor="repo1")
     s_rev = summarize_experiment(out)
-    assert s_rev["scored_pairs_count"] == 1
-    assert s_rev["provenance_verified"] is True
-    assert s_rev["timing_eligible"] is True
+    assert s_rev["scored_pairs_count"] == 0
+    assert s_rev["provenance_verified"] is False
+    assert s_rev["timing_eligible"] is False
+    assert s_rev["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s_rev["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert s_rev["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # 1b. Publisher 'Reuters' with routing vendor 'repo1'
     write_experiment("Reuters", arm_b_vendor="repo1")
     s_reuters = summarize_experiment(out)
-    assert s_reuters["scored_pairs_count"] == 1
-    assert s_reuters["provenance_verified"] is True
-    assert s_reuters["timing_eligible"] is True
+    assert s_reuters["scored_pairs_count"] == 0
+    assert s_reuters["provenance_verified"] is False
+    assert s_reuters["timing_eligible"] is False
+    assert s_reuters["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert (
+        s_reuters["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    )
+    assert s_reuters["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # 1c. Publisher 'Bloomberg' with routing vendor 'news_intelligence'
     write_experiment("Bloomberg", arm_b_vendor="news_intelligence")
     s_bloomberg = summarize_experiment(out)
-    assert s_bloomberg["scored_pairs_count"] == 1
-    assert s_bloomberg["provenance_verified"] is True
-    assert s_bloomberg["timing_eligible"] is True
+    assert s_bloomberg["scored_pairs_count"] == 0
+    assert s_bloomberg["provenance_verified"] is False
+    assert s_bloomberg["timing_eligible"] is False
+    assert s_bloomberg["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert (
+        s_bloomberg["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    )
+    assert s_bloomberg["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # 2. Wrong or missing routing vendor fails closed regardless of publisher
     # 2a. Arm B with invalid routing vendor 'yfinance'
@@ -8026,9 +8115,12 @@ def test_r11_proving_r1_explicit_null_enrichment_not_backfilled_from_wrapper(
     ev_pos["enrichedAt"] = "2026-08-03T13:02:00Z"
     write_setup(ev_pos, text_B_override=obs_with_derived)
     s_pos = summarize_experiment(out)
-    assert s_pos["scored_pairs_count"] == 1
-    assert s_pos["provenance_verified"] is True
-    assert s_pos["timing_eligible"] is True
+    assert s_pos["scored_pairs_count"] == 0
+    assert s_pos["provenance_verified"] is False
+    assert s_pos["timing_eligible"] is False
+    assert s_pos["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s_pos["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert s_pos["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
 
 def test_r11_proving_r2_native_global_news_outputs_and_multi_tool_runs(
@@ -8307,9 +8399,12 @@ def test_r11_proving_r2_native_global_news_outputs_and_multi_tool_runs(
 
     setup_pure_global()
     s_pure = summarize_experiment(out)
-    assert s_pure["scored_pairs_count"] == 1
-    assert s_pure["provenance_verified"] is True
-    assert s_pure["timing_eligible"] is True
+    assert s_pure["scored_pairs_count"] == 0
+    assert s_pure["provenance_verified"] is False
+    assert s_pure["timing_eligible"] is False
+    assert s_pure["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s_pure["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert s_pure["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # -------------------------------------------------------------
     # 3. Multi-Tool Run containing BOTH get_news AND get_global_news (Positive Case)
@@ -8408,9 +8503,12 @@ def test_r11_proving_r2_native_global_news_outputs_and_multi_tool_runs(
 
     setup_multi_tool()
     s_multi = summarize_experiment(out)
-    assert s_multi["scored_pairs_count"] == 1
-    assert s_multi["provenance_verified"] is True
-    assert s_multi["timing_eligible"] is True
+    assert s_multi["scored_pairs_count"] == 0
+    assert s_multi["provenance_verified"] is False
+    assert s_multi["timing_eligible"] is False
+    assert s_multi["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s_multi["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert s_multi["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # -------------------------------------------------------------
     # 4. Ineligible Cases: Wrong window, missing event proof, changed output
@@ -8761,9 +8859,14 @@ def test_r12_proving_r1_optional_null_global_news_parameters(
         )
 
         s_var = summarize_experiment(var_out)
-        assert s_var["scored_pairs_count"] == 1, f"Failed for variant {label}"
-        assert s_var["provenance_verified"] is True, f"Failed provenance for variant {label}"
-        assert s_var["timing_eligible"] is True, f"Failed timing for variant {label}"
+        assert s_var["scored_pairs_count"] == 0, f"Failed for variant {label}"
+        assert s_var["provenance_verified"] is False, f"Failed provenance for variant {label}"
+        assert s_var["timing_eligible"] is False, f"Failed timing for variant {label}"
+        assert s_var["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+        assert (
+            s_var["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+        )
+        assert s_var["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # --- 3. Mixed Asset / Global Captures with Explicit Null Options ---
     mixed_out = tmp_path / "exp_r12_r1_mixed_null"
@@ -8861,9 +8964,12 @@ def test_r12_proving_r1_optional_null_global_news_parameters(
     )
 
     s_mixed = summarize_experiment(mixed_out)
-    assert s_mixed["scored_pairs_count"] == 1
-    assert s_mixed["provenance_verified"] is True
-    assert s_mixed["timing_eligible"] is True
+    assert s_mixed["scored_pairs_count"] == 0
+    assert s_mixed["provenance_verified"] is False
+    assert s_mixed["timing_eligible"] is False
+    assert s_mixed["diagnostic_summary"]["diagnostic_scored_pairs_count"] == 1
+    assert s_mixed["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_provenance_verified"] is True
+    assert s_mixed["pair_eligibility"]["NVDA_2026-08-03"]["diagnostic_timing_eligible"] is True
 
     # --- 4. Strict Failure Modes ---
     # 4a. Invalid non-numeric string parameter fails closed with accurate parameter error
@@ -8976,3 +9082,4350 @@ def test_r12_proving_r1_optional_null_global_news_parameters(
     s_missing = summarize_experiment(neg_out)
     assert s_missing["scored_pairs_count"] == 0
     assert s_missing["provenance_verified"] is False
+
+
+# ---------------------------------------------------------------------------
+# Section 7.2 Proving Test Matrix (TIP-14 Prospective Evidence Capture)
+# ---------------------------------------------------------------------------
+
+
+def test_prosp_r4_r1_01_full_producer_parity(tmp_path: Path) -> None:
+    """TEST-PROSP-R4-R1-01: Full producer response reconstruction matches byte-for-byte and hash-for-hash."""
+    cell_dir_a = tmp_path / "cell_A"
+    cell_dir_b = tmp_path / "cell_B"
+    cell_dir_a.mkdir(parents=True)
+    cell_dir_b.mkdir(parents=True)
+
+    cutoff_dt = datetime(2026, 10, 19, 20, 0, 0, tzinfo=UTC)
+
+    # 1. Arm A Yahoo Asset News
+    import tradingagents.dataflows.vendors.yahoo.news as yahoo_news
+
+    raw_article_a = {
+        "content": {
+            "title": "Apple Reports Record Quarterly Results",
+            "summary": "Apple announced revenue for the fiscal fourth quarter.",
+            "provider": {"displayName": "Reuters"},
+            "canonicalUrl": {"url": "https://finance.yahoo.com/news/apple-record"},
+            "pubDate": "2026-10-19T14:30:00Z",
+        }
+    }
+    extracted_a = [yahoo_news._extract_article_data(raw_article_a)]
+    fmt_a = yahoo_news._format_articles(extracted_a)
+    out_text_a = f"## AAPL News, from 2026-10-12 to 2026-10-19:\n\n{fmt_a}"
+    out_hash_a = hashlib.sha256(out_text_a.encode("utf-8")).hexdigest()
+
+    (cell_dir_a / "results").mkdir(parents=True)
+    (cell_dir_a / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {
+                            "ticker": "AAPL",
+                            "start_date": "2026-10-12",
+                            "end_date": "2026-10-19",
+                        },
+                        "run_id": "run-a-1",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": out_text_a,
+                        "output_hash": out_hash_a,
+                        "run_id": "run-a-1",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    responses_dir_a = cell_dir_a / "data" / "responses"
+    responses_dir_a.mkdir(parents=True)
+    snap_file_a = responses_dir_a / "001_get_news_call-a-1.json"
+    snap_bytes_a = json.dumps([raw_article_a], indent=2, sort_keys=True).encode("utf-8")
+    snap_file_a.write_bytes(snap_bytes_a)
+    raw_hash_a = hashlib.sha256(
+        json.dumps([raw_article_a], sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    archive_a = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-a-1",
+        "ticker": "AAPL",
+        "arm": "A",
+        "date": "2026-10-19",
+        "cutoff": "2026-10-19T20:00:00Z",
+        "vendor": "yfinance",
+        "created_at": "2026-10-19T14:35:00Z",
+        "calls": [
+            {
+                "call_seq": 1,
+                "call_id": "call-a-1",
+                "tool": "get_news",
+                "run_id": "run-a-1",
+                "query": "AAPL",
+                "received_at": "2026-10-19T14:35:00Z",
+                "params": {
+                    "ticker": "AAPL",
+                    "start_date": "2026-10-12",
+                    "end_date": "2026-10-19",
+                },
+                "snapshot_path": "responses/001_get_news_call-a-1.json",
+                "raw_payload_hash": raw_hash_a,
+                "records": [
+                    {
+                        "title": extracted_a[0]["title"],
+                        "summary": extracted_a[0]["summary"],
+                        "publisher": extracted_a[0]["publisher"],
+                        "link": extracted_a[0]["link"],
+                        "pub_date": extracted_a[0]["pub_date"].isoformat(),
+                    }
+                ],
+                "output_hash": out_hash_a,
+            }
+        ],
+        "articles": [],
+    }
+    archive_path_a = cell_dir_a / "data" / "baseline_archive.json"
+    archive_path_a.write_text(json.dumps(archive_a, indent=2), encoding="utf-8")
+
+    ok_a, msg_a = validate_evidence_archive(
+        archive_path_a,
+        "A",
+        "AAPL",
+        "2026-10-19",
+        cutoff_dt,
+        {"attempt_id": "att-a-1"},
+        cell_dir_a,
+    )
+    assert ok_a is True, f"Arm A verification failed: {msg_a}"
+
+    # 2. Arm B Repo 1 Asset News
+    import tradingagents.dataflows.vendors.news_intelligence.client as ni_client
+
+    raw_event_b = {
+        "id": "evt-b-001",
+        "source": "Bloomberg",
+        "title": "NVIDIA Unveils Next-Gen Blackwell Ultra Chips",
+        "publishedAt": "2026-10-19T15:00:00Z",
+        "receivedAt": "2026-10-19T15:01:00Z",
+        "enrichedAt": "2026-10-19T15:02:00Z",
+        "sentiment": {"score": 0.9, "label": "positive", "confidence": 0.95},
+        "symbols": ["NVDA"],
+        "url": "https://example.com/nvda-blackwell",
+        "summary": "NVIDIA announced Blackwell Ultra enterprise chips.",
+    }
+    sanitized_b = ni_client.filter_and_sanitize_event(
+        raw_event_b,
+        cutoff_dt=cutoff_dt,
+        min_pub_dt=datetime(2026, 10, 12, 0, 0, 0, tzinfo=UTC),
+        max_pub_dt=cutoff_dt,
+    )
+    assert sanitized_b is not None
+    fmt_b = ni_client.format_article(sanitized_b)
+    out_text_b = f"## NVDA News, from 2026-10-12 to 2026-10-19:\n\n{fmt_b}"
+    out_hash_b = hashlib.sha256(out_text_b.encode("utf-8")).hexdigest()
+
+    (cell_dir_b / "results").mkdir(parents=True)
+    (cell_dir_b / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {
+                            "ticker": "NVDA",
+                            "start_date": "2026-10-12",
+                            "end_date": "2026-10-19",
+                        },
+                        "run_id": "run-b-1",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": out_text_b,
+                        "output_hash": out_hash_b,
+                        "run_id": "run-b-1",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    responses_dir_b = cell_dir_b / "data" / "responses"
+    responses_dir_b.mkdir(parents=True)
+    snap_file_b = responses_dir_b / "001_get_news_call-b-1.json"
+    raw_payload_b = {"events": [raw_event_b]}
+    snap_bytes_b = json.dumps(raw_payload_b, indent=2, sort_keys=True).encode("utf-8")
+    snap_file_b.write_bytes(snap_bytes_b)
+    raw_hash_b = hashlib.sha256(
+        json.dumps(raw_payload_b, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    archive_b = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-b-1",
+        "ticker": "NVDA",
+        "arm": "B",
+        "date": "2026-10-19",
+        "cutoff": "2026-10-19T20:00:00Z",
+        "vendor": "news_intelligence",
+        "created_at": "2026-10-19T15:05:00Z",
+        "calls": [
+            {
+                "call_seq": 1,
+                "call_id": "call-b-1",
+                "tool": "get_news",
+                "run_id": "run-b-1",
+                "query": "NVDA",
+                "received_at": "2026-10-19T15:05:00Z",
+                "params": {
+                    "symbol": "NVDA",
+                    "from": "2026-10-12T00:00:00Z",
+                    "to": "2026-10-19T23:59:59.999999Z",
+                    "asOf": "2026-10-19T23:59:59.999999Z",
+                },
+                "producer_params": {
+                    "ticker": "NVDA",
+                    "start_date": "2026-10-12",
+                    "end_date": "2026-10-19",
+                },
+                "snapshot_path": "responses/001_get_news_call-b-1.json",
+                "raw_payload_hash": raw_hash_b,
+                "records": [sanitized_b],
+                "output_hash": out_hash_b,
+            }
+        ],
+        "events": [],
+    }
+    archive_path_b = cell_dir_b / "data" / "provenance_archive.json"
+    archive_path_b.write_text(json.dumps(archive_b, indent=2), encoding="utf-8")
+
+    ok_b, msg_b = validate_evidence_archive(
+        archive_path_b,
+        "B",
+        "NVDA",
+        "2026-10-19",
+        cutoff_dt,
+        {"attempt_id": "att-b-1"},
+        cell_dir_b,
+    )
+    assert ok_b is True, f"Arm B verification failed: {msg_b}"
+
+
+def test_prosp_r4_r1_02_altered_header_body_only_fails(tmp_path: Path) -> None:
+    """TEST-PROSP-R4-R1-02: Body-only text or altered header fails verification against real tool output."""
+    cell_dir = tmp_path / "cell_altered"
+    cell_dir.mkdir(parents=True)
+    cutoff_dt = datetime(2026, 10, 19, 20, 0, 0, tzinfo=UTC)
+
+    import tradingagents.dataflows.vendors.yahoo.news as yahoo_news
+
+    raw_art = {
+        "title": "Sample Article",
+        "summary": "Sample summary.",
+        "publisher": "Yahoo",
+        "link": "https://example.com/art",
+        "providerPublishTime": int(datetime(2026, 10, 19, 12, 0, 0, tzinfo=UTC).timestamp()),
+    }
+    extracted = [yahoo_news._extract_article_data(raw_art)]
+    body_only = yahoo_news._format_articles(extracted)
+
+    (cell_dir / "results").mkdir(parents=True)
+    (cell_dir / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {
+                            "ticker": "AAPL",
+                            "start_date": "2026-10-12",
+                            "end_date": "2026-10-19",
+                        },
+                        "run_id": "run-alt-1",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": body_only,
+                        "output_hash": hashlib.sha256(body_only.encode("utf-8")).hexdigest(),
+                        "run_id": "run-alt-1",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    responses_dir = cell_dir / "data" / "responses"
+    responses_dir.mkdir(parents=True)
+    snap_file = responses_dir / "001_get_news_call-1.json"
+    snap_file.write_text(json.dumps([raw_art]), encoding="utf-8")
+    raw_hash = hashlib.sha256(json.dumps([raw_art], sort_keys=True).encode("utf-8")).hexdigest()
+
+    archive = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-1",
+        "ticker": "AAPL",
+        "arm": "A",
+        "date": "2026-10-19",
+        "cutoff": "2026-10-19T20:00:00Z",
+        "vendor": "yfinance",
+        "calls": [
+            {
+                "call_seq": 1,
+                "call_id": "call-1",
+                "tool": "get_news",
+                "run_id": "run-alt-1",
+                "query": "AAPL",
+                "received_at": "2026-10-19T14:00:00Z",
+                "params": {
+                    "ticker": "AAPL",
+                    "start_date": "2026-10-12",
+                    "end_date": "2026-10-19",
+                },
+                "snapshot_path": "responses/001_get_news_call-1.json",
+                "raw_payload_hash": raw_hash,
+                "records": [{**extracted[0], "pub_date": extracted[0]["pub_date"].isoformat()}],
+                "output_hash": hashlib.sha256(body_only.encode("utf-8")).hexdigest(),
+            }
+        ],
+    }
+    arch_path = cell_dir / "data" / "baseline_archive.json"
+    arch_path.write_text(json.dumps(archive), encoding="utf-8")
+
+    ok, msg = validate_evidence_archive(
+        arch_path, "A", "AAPL", "2026-10-19", cutoff_dt, {"attempt_id": "att-1"}, cell_dir
+    )
+    assert ok is False
+    assert "derived candidate hash mismatch" in msg or "output text does not match" in msg
+
+
+def test_prosp_r4_r1_03_empty_window_sentinels(tmp_path: Path) -> None:
+    """TEST-PROSP-R4-R1-03: Empty window sentinels reconstruct and validate identically."""
+    cutoff_dt = datetime(2026, 10, 19, 20, 0, 0, tzinfo=UTC)
+
+    # 1. Arm A Yahoo unavailable / empty coverage gap sentinel
+    cell_dir_a = tmp_path / "cell_empty_a"
+    cell_dir_a.mkdir(parents=True)
+    sentinel_text_a = "<Yahoo Finance news unavailable for 2026-10-12..2026-10-19: the window extends past today, so this is not an absence of news for AAPL>"
+    sentinel_hash_a = hashlib.sha256(sentinel_text_a.encode("utf-8")).hexdigest()
+
+    (cell_dir_a / "results").mkdir(parents=True)
+    (cell_dir_a / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {
+                            "ticker": "AAPL",
+                            "start_date": "2026-10-12",
+                            "end_date": "2026-10-19",
+                        },
+                        "run_id": "run-empty-a",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": sentinel_text_a,
+                        "output_hash": sentinel_hash_a,
+                        "run_id": "run-empty-a",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    resp_dir_a = cell_dir_a / "data" / "responses"
+    resp_dir_a.mkdir(parents=True)
+    snap_a = resp_dir_a / "001_get_news_call-empty-a.json"
+    snap_a.write_text(json.dumps([]), encoding="utf-8")
+    raw_hash_a = hashlib.sha256(json.dumps([], sort_keys=True).encode("utf-8")).hexdigest()
+
+    arch_a = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-empty-a",
+        "ticker": "AAPL",
+        "arm": "A",
+        "date": "2026-10-19",
+        "cutoff": "2026-10-19T20:00:00Z",
+        "vendor": "yfinance",
+        "calls": [
+            {
+                "call_seq": 1,
+                "call_id": "call-empty-a",
+                "tool": "get_news",
+                "run_id": "run-empty-a",
+                "query": "AAPL",
+                "received_at": "2026-10-19T14:00:00Z",
+                "params": {
+                    "ticker": "AAPL",
+                    "start_date": "2026-10-12",
+                    "end_date": "2026-10-19",
+                },
+                "snapshot_path": "responses/001_get_news_call-empty-a.json",
+                "raw_payload_hash": raw_hash_a,
+                "records": [],
+                "output_hash": sentinel_hash_a,
+            }
+        ],
+    }
+    arch_path_a = cell_dir_a / "data" / "baseline_archive.json"
+    arch_path_a.write_text(json.dumps(arch_a), encoding="utf-8")
+
+    ok_a, msg_a = validate_evidence_archive(
+        arch_path_a, "A", "AAPL", "2026-10-19", cutoff_dt, {"attempt_id": "att-empty-a"}, cell_dir_a
+    )
+    assert ok_a is True, f"Arm A empty sentinel validation failed: {msg_a}"
+
+    # 2. Arm B News Intelligence 'No news found' empty sentinel
+    cell_dir_b = tmp_path / "cell_empty_b"
+    cell_dir_b.mkdir(parents=True)
+    sentinel_text_b = "No news found for AAPL between 2026-10-12 and 2026-10-19"
+    sentinel_hash_b = hashlib.sha256(sentinel_text_b.encode("utf-8")).hexdigest()
+
+    (cell_dir_b / "results").mkdir(parents=True)
+    (cell_dir_b / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {
+                            "ticker": "AAPL",
+                            "start_date": "2026-10-12",
+                            "end_date": "2026-10-19",
+                        },
+                        "run_id": "run-empty-b",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": sentinel_text_b,
+                        "output_hash": sentinel_hash_b,
+                        "run_id": "run-empty-b",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    resp_dir_b = cell_dir_b / "data" / "responses"
+    resp_dir_b.mkdir(parents=True)
+    snap_b = resp_dir_b / "001_get_news_call-empty-b.json"
+    snap_b.write_text(json.dumps({"events": []}), encoding="utf-8")
+    raw_hash_b = hashlib.sha256(
+        json.dumps({"events": []}, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    arch_b = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-empty-b",
+        "ticker": "AAPL",
+        "arm": "B",
+        "date": "2026-10-19",
+        "cutoff": "2026-10-19T20:00:00Z",
+        "vendor": "news_intelligence",
+        "calls": [
+            {
+                "call_seq": 1,
+                "call_id": "call-empty-b",
+                "tool": "get_news",
+                "run_id": "run-empty-b",
+                "query": "AAPL",
+                "received_at": "2026-10-19T14:00:00Z",
+                "params": {
+                    "symbol": "AAPL",
+                    "from": "2026-10-12T00:00:00Z",
+                    "to": "2026-10-19T23:59:59.999999Z",
+                    "asOf": "2026-10-19T23:59:59.999999Z",
+                },
+                "producer_params": {
+                    "ticker": "AAPL",
+                    "start_date": "2026-10-12",
+                    "end_date": "2026-10-19",
+                },
+                "snapshot_path": "responses/001_get_news_call-empty-b.json",
+                "raw_payload_hash": raw_hash_b,
+                "records": [],
+                "output_hash": sentinel_hash_b,
+            }
+        ],
+    }
+    arch_path_b = cell_dir_b / "data" / "provenance_archive.json"
+    arch_path_b.write_text(json.dumps(arch_b), encoding="utf-8")
+
+    ok_b, msg_b = validate_evidence_archive(
+        arch_path_b, "B", "AAPL", "2026-10-19", cutoff_dt, {"attempt_id": "att-empty-b"}, cell_dir_b
+    )
+    assert ok_b is True, f"Arm B empty sentinel validation failed: {msg_b}"
+
+
+def test_prosp_r4_r2_01_arm_a_yahoo_flat_and_nested_equality(tmp_path: Path) -> None:
+    """TEST-PROSP-R4-R2-01: Arm A flat and nested Yahoo articles validate against _extract_article_data without fabricated fields."""
+    cell_dir = tmp_path / "cell_yahoo_equality"
+    cell_dir.mkdir(parents=True)
+    cutoff_dt = datetime(2026, 10, 19, 20, 0, 0, tzinfo=UTC)
+
+    import tradingagents.dataflows.vendors.yahoo.news as yahoo_news
+
+    art_nested = {
+        "content": {
+            "title": "Nested Article Title",
+            "summary": "Nested summary text",
+            "provider": {"displayName": "Nested Publisher"},
+            "canonicalUrl": {"url": "https://example.com/nested"},
+            "pubDate": "2026-10-19T12:00:00Z",
+        }
+    }
+    art_flat = {
+        "title": "Flat Article Title",
+        "summary": "Flat summary text",
+        "publisher": "Flat Publisher",
+        "link": "https://example.com/flat",
+        "providerPublishTime": int(datetime(2026, 10, 19, 13, 0, 0, tzinfo=UTC).timestamp()),
+    }
+    raw_articles = [art_nested, art_flat]
+    extracted = [yahoo_news._extract_article_data(a) for a in raw_articles]
+
+    out_text = (
+        f"## MSFT News, from 2026-10-12 to 2026-10-19:\n\n{yahoo_news._format_articles(extracted)}"
+    )
+    out_hash = hashlib.sha256(out_text.encode("utf-8")).hexdigest()
+
+    (cell_dir / "results").mkdir(parents=True)
+    (cell_dir / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {
+                            "ticker": "MSFT",
+                            "start_date": "2026-10-12",
+                            "end_date": "2026-10-19",
+                        },
+                        "run_id": "run-eq-1",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": out_text,
+                        "output_hash": out_hash,
+                        "run_id": "run-eq-1",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    responses_dir = cell_dir / "data" / "responses"
+    responses_dir.mkdir(parents=True)
+    snap_file = responses_dir / "001_get_news_call-eq.json"
+    snap_file.write_text(json.dumps(raw_articles, indent=2), encoding="utf-8")
+    raw_hash = hashlib.sha256(json.dumps(raw_articles, sort_keys=True).encode("utf-8")).hexdigest()
+
+    archive = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-eq-1",
+        "ticker": "MSFT",
+        "arm": "A",
+        "date": "2026-10-19",
+        "cutoff": "2026-10-19T20:00:00Z",
+        "vendor": "yfinance",
+        "calls": [
+            {
+                "call_seq": 1,
+                "call_id": "call-eq",
+                "tool": "get_news",
+                "run_id": "run-eq-1",
+                "query": "MSFT",
+                "received_at": "2026-10-19T14:00:00Z",
+                "params": {
+                    "ticker": "MSFT",
+                    "start_date": "2026-10-12",
+                    "end_date": "2026-10-19",
+                },
+                "snapshot_path": "responses/001_get_news_call-eq.json",
+                "raw_payload_hash": raw_hash,
+                "records": [
+                    {
+                        "title": e["title"],
+                        "summary": e["summary"],
+                        "publisher": e["publisher"],
+                        "link": e["link"],
+                        "pub_date": e["pub_date"].isoformat(),
+                    }
+                    for e in extracted
+                ],
+                "output_hash": out_hash,
+            }
+        ],
+    }
+    arch_path = cell_dir / "data" / "baseline_archive.json"
+    arch_path.write_text(json.dumps(archive), encoding="utf-8")
+
+    ok, msg = validate_evidence_archive(
+        arch_path, "A", "MSFT", "2026-10-19", cutoff_dt, {"attempt_id": "att-eq-1"}, cell_dir
+    )
+    assert ok is True, f"Arm A equality verification failed: {msg}"
+
+
+def test_prosp_r4_r2_02_arm_a_metadata_mutation_fails(tmp_path: Path) -> None:
+    """TEST-PROSP-R4-R2-02: Mutating call['received_at'] to exceed cutoff fails observation clock verification."""
+    cell_dir = tmp_path / "cell_mutation_a"
+    cell_dir.mkdir(parents=True)
+    cutoff_dt = datetime(2026, 10, 19, 20, 0, 0, tzinfo=UTC)
+
+    import tradingagents.dataflows.vendors.yahoo.news as yahoo_news
+
+    raw_art = {
+        "title": "Article",
+        "summary": "Summary",
+        "publisher": "Yahoo",
+        "link": "https://example.com/art",
+        "providerPublishTime": int(datetime(2026, 10, 19, 12, 0, 0, tzinfo=UTC).timestamp()),
+    }
+    extracted = [yahoo_news._extract_article_data(raw_art)]
+    out_text = (
+        f"## TSLA News, from 2026-10-12 to 2026-10-19:\n\n{yahoo_news._format_articles(extracted)}"
+    )
+    out_hash = hashlib.sha256(out_text.encode("utf-8")).hexdigest()
+
+    (cell_dir / "results").mkdir(parents=True)
+    (cell_dir / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {
+                            "ticker": "TSLA",
+                            "start_date": "2026-10-12",
+                            "end_date": "2026-10-19",
+                        },
+                        "run_id": "run-mut-1",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": out_text,
+                        "output_hash": out_hash,
+                        "run_id": "run-mut-1",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    responses_dir = cell_dir / "data" / "responses"
+    responses_dir.mkdir(parents=True)
+    snap_file = responses_dir / "001_get_news_call-mut.json"
+    snap_file.write_text(json.dumps([raw_art]), encoding="utf-8")
+    raw_hash = hashlib.sha256(json.dumps([raw_art], sort_keys=True).encode("utf-8")).hexdigest()
+
+    archive = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-mut-1",
+        "ticker": "TSLA",
+        "arm": "A",
+        "date": "2026-10-19",
+        "cutoff": "2026-10-19T20:00:00Z",
+        "vendor": "yfinance",
+        "calls": [
+            {
+                "call_seq": 1,
+                "call_id": "call-mut",
+                "tool": "get_news",
+                "run_id": "run-mut-1",
+                "query": "TSLA",
+                "received_at": "2026-10-20T10:00:00Z",
+                "params": {
+                    "ticker": "TSLA",
+                    "start_date": "2026-10-12",
+                    "end_date": "2026-10-19",
+                },
+                "snapshot_path": "responses/001_get_news_call-mut.json",
+                "raw_payload_hash": raw_hash,
+                "records": [
+                    {
+                        "title": extracted[0]["title"],
+                        "summary": extracted[0]["summary"],
+                        "publisher": extracted[0]["publisher"],
+                        "link": extracted[0]["link"],
+                        "pub_date": extracted[0]["pub_date"].isoformat(),
+                    }
+                ],
+                "output_hash": out_hash,
+            }
+        ],
+    }
+    arch_path = cell_dir / "data" / "baseline_archive.json"
+    arch_path.write_text(json.dumps(archive), encoding="utf-8")
+
+    ok, msg = validate_evidence_archive(
+        arch_path, "A", "TSLA", "2026-10-19", cutoff_dt, {"attempt_id": "att-mut-1"}, cell_dir
+    )
+    assert ok is False
+    assert "exceeds entry cutoff" in msg
+
+
+def test_prosp_r4_r2_03_arm_b_canonical_event_equality(tmp_path: Path) -> None:
+    """TEST-PROSP-R4-R2-03: Arm B canonical event equality validates id, publishedAt, receivedAt, enrichedAt, symbols."""
+    cell_dir = tmp_path / "cell_canonical_b"
+    cell_dir.mkdir(parents=True)
+    cutoff_dt = datetime(2026, 10, 19, 20, 0, 0, tzinfo=UTC)
+
+    import tradingagents.dataflows.vendors.news_intelligence.client as ni_client
+
+    raw_event = {
+        "id": "canon-evt-123",
+        "source": "Reuters",
+        "title": "Semiconductor Demand Surges",
+        "publishedAt": "2026-10-19T14:00:00Z",
+        "receivedAt": "2026-10-19T14:02:00Z",
+        "enrichedAt": "2026-10-19T14:05:00Z",
+        "sentiment": {"score": 0.75, "label": "positive", "confidence": 0.88},
+        "symbols": ["AMD"],
+        "url": "https://example.com/amd-semis",
+        "summary": "Strong demand reported across enterprise data centers.",
+    }
+    sanitized = ni_client.filter_and_sanitize_event(
+        raw_event,
+        cutoff_dt=cutoff_dt,
+        min_pub_dt=datetime(2026, 10, 12, 0, 0, 0, tzinfo=UTC),
+        max_pub_dt=cutoff_dt,
+    )
+    assert sanitized is not None
+    fmt = ni_client.format_article(sanitized)
+    out_text = f"## AMD News, from 2026-10-12 to 2026-10-19:\n\n{fmt}"
+    out_hash = hashlib.sha256(out_text.encode("utf-8")).hexdigest()
+
+    (cell_dir / "results").mkdir(parents=True)
+    (cell_dir / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {
+                            "ticker": "AMD",
+                            "start_date": "2026-10-12",
+                            "end_date": "2026-10-19",
+                        },
+                        "run_id": "run-b-canon",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": out_text,
+                        "output_hash": out_hash,
+                        "run_id": "run-b-canon",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    responses_dir = cell_dir / "data" / "responses"
+    responses_dir.mkdir(parents=True)
+    snap_file = responses_dir / "001_get_news_call-canon.json"
+    snap_file.write_text(json.dumps({"events": [raw_event]}), encoding="utf-8")
+    raw_hash = hashlib.sha256(
+        json.dumps({"events": [raw_event]}, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    archive = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-canon-1",
+        "ticker": "AMD",
+        "arm": "B",
+        "date": "2026-10-19",
+        "cutoff": "2026-10-19T20:00:00Z",
+        "vendor": "news_intelligence",
+        "calls": [
+            {
+                "call_seq": 1,
+                "call_id": "call-canon",
+                "tool": "get_news",
+                "run_id": "run-b-canon",
+                "query": "AMD",
+                "received_at": "2026-10-19T14:10:00Z",
+                "params": {
+                    "symbol": "AMD",
+                    "from": "2026-10-12T00:00:00Z",
+                    "to": "2026-10-19T23:59:59.999999Z",
+                    "asOf": "2026-10-19T23:59:59.999999Z",
+                },
+                "producer_params": {
+                    "ticker": "AMD",
+                    "start_date": "2026-10-12",
+                    "end_date": "2026-10-19",
+                },
+                "snapshot_path": "responses/001_get_news_call-canon.json",
+                "raw_payload_hash": raw_hash,
+                "records": [sanitized],
+                "output_hash": out_hash,
+            }
+        ],
+    }
+    arch_path = cell_dir / "data" / "provenance_archive.json"
+    arch_path.write_text(json.dumps(archive), encoding="utf-8")
+
+    ok, msg = validate_evidence_archive(
+        arch_path, "B", "AMD", "2026-10-19", cutoff_dt, {"attempt_id": "att-canon-1"}, cell_dir
+    )
+    assert ok is True, f"Arm B canonical equality failed: {msg}"
+
+
+def test_prosp_r4_r2_04_arm_b_backdating_mutation_fails(tmp_path: Path) -> None:
+    """TEST-PROSP-R4-R2-04: Backdating receivedAt or enrichedAt in stored records fails equality against raw snapshot."""
+    cell_dir = tmp_path / "cell_backdate_b"
+    cell_dir.mkdir(parents=True)
+    cutoff_dt = datetime(2026, 10, 19, 20, 0, 0, tzinfo=UTC)
+
+    import tradingagents.dataflows.vendors.news_intelligence.client as ni_client
+
+    raw_event = {
+        "id": "backdate-evt",
+        "source": "Bloomberg",
+        "title": "Fed Interest Rate Speculation",
+        "publishedAt": "2026-10-19T14:00:00Z",
+        "receivedAt": "2026-10-19T14:02:00Z",
+        "enrichedAt": "2026-10-19T14:05:00Z",
+        "sentiment": {"score": -0.2, "label": "negative", "confidence": 0.7},
+        "symbols": ["SPY"],
+        "url": "https://example.com/spy",
+        "summary": "Markets react to interest rate comments.",
+    }
+    sanitized = ni_client.filter_and_sanitize_event(
+        raw_event,
+        cutoff_dt=cutoff_dt,
+        min_pub_dt=datetime(2026, 10, 12, 0, 0, 0, tzinfo=UTC),
+        max_pub_dt=cutoff_dt,
+    )
+    assert sanitized is not None
+    fmt = ni_client.format_article(sanitized)
+    out_text = f"## SPY News, from 2026-10-12 to 2026-10-19:\n\n{fmt}"
+    out_hash = hashlib.sha256(out_text.encode("utf-8")).hexdigest()
+
+    (cell_dir / "results").mkdir(parents=True)
+    (cell_dir / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {
+                            "ticker": "SPY",
+                            "start_date": "2026-10-12",
+                            "end_date": "2026-10-19",
+                        },
+                        "run_id": "run-backdate",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": out_text,
+                        "output_hash": out_hash,
+                        "run_id": "run-backdate",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    responses_dir = cell_dir / "data" / "responses"
+    responses_dir.mkdir(parents=True)
+    snap_file = responses_dir / "001_get_news_call-backdate.json"
+    snap_file.write_text(json.dumps({"events": [raw_event]}), encoding="utf-8")
+    raw_hash = hashlib.sha256(
+        json.dumps({"events": [raw_event]}, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    # Tamper receivedAt in stored records (backdating)
+    mutated_record = dict(sanitized, receivedAt="2026-10-19T13:00:00Z")
+
+    archive = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-backdate-1",
+        "ticker": "SPY",
+        "arm": "B",
+        "date": "2026-10-19",
+        "cutoff": "2026-10-19T20:00:00Z",
+        "vendor": "news_intelligence",
+        "calls": [
+            {
+                "call_seq": 1,
+                "call_id": "call-backdate",
+                "tool": "get_news",
+                "run_id": "run-backdate",
+                "query": "SPY",
+                "received_at": "2026-10-19T14:10:00Z",
+                "params": {
+                    "symbol": "SPY",
+                    "from": "2026-10-12T00:00:00Z",
+                    "to": "2026-10-19T23:59:59.999999Z",
+                    "asOf": "2026-10-19T23:59:59.999999Z",
+                },
+                "producer_params": {
+                    "ticker": "SPY",
+                    "start_date": "2026-10-12",
+                    "end_date": "2026-10-19",
+                },
+                "snapshot_path": "responses/001_get_news_call-backdate.json",
+                "raw_payload_hash": raw_hash,
+                "records": [mutated_record],
+                "output_hash": out_hash,
+            }
+        ],
+    }
+    arch_path = cell_dir / "data" / "provenance_archive.json"
+    arch_path.write_text(json.dumps(archive), encoding="utf-8")
+
+    ok, msg = validate_evidence_archive(
+        arch_path, "B", "SPY", "2026-10-19", cutoff_dt, {"attempt_id": "att-backdate-1"}, cell_dir
+    )
+    assert ok is False
+    assert "Arm B canonical field mismatch on 'receivedAt'" in msg
+
+
+def test_prosp_r1_05_v2_fail_closed_on_missing_calls_or_snapshot(tmp_path: Path) -> None:
+    """TEST-PROSP-R1-05: Envelope with version 't13-archive/v2' missing calls or snapshot fails closed immediately."""
+    cell_dir = tmp_path / "cell_v2_fail_closed"
+    cell_dir.mkdir(parents=True)
+    cutoff_dt = datetime(2026, 10, 19, 20, 0, 0, tzinfo=UTC)
+
+    (cell_dir / "results").mkdir(parents=True)
+    (cell_dir / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {
+                            "ticker": "AAPL",
+                            "start_date": "2026-10-12",
+                            "end_date": "2026-10-19",
+                        },
+                        "run_id": "run-fc-1",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": "dummy output",
+                        "output_hash": hashlib.sha256(b"dummy output").hexdigest(),
+                        "run_id": "run-fc-1",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 1. Missing calls list
+    arch_no_calls = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-fc-1",
+        "ticker": "AAPL",
+        "arm": "A",
+        "date": "2026-10-19",
+        "vendor": "yfinance",
+    }
+    p_no_calls = cell_dir / "data" / "arch_no_calls.json"
+    p_no_calls.parent.mkdir(parents=True, exist_ok=True)
+    p_no_calls.write_text(json.dumps(arch_no_calls), encoding="utf-8")
+    ok1, msg1 = validate_evidence_archive(
+        p_no_calls, "A", "AAPL", "2026-10-19", cutoff_dt, {"attempt_id": "att-fc-1"}, cell_dir
+    )
+    assert ok1 is False
+    assert "missing or empty calls list" in msg1
+
+    # 2. Missing snapshot on disk
+    arch_missing_snap = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-fc-1",
+        "ticker": "AAPL",
+        "arm": "A",
+        "date": "2026-10-19",
+        "vendor": "yfinance",
+        "calls": [
+            {
+                "call_seq": 1,
+                "call_id": "call-fc-1",
+                "tool": "get_news",
+                "run_id": "run-fc-1",
+                "snapshot_path": "responses/nonexistent_snap.json",
+                "raw_payload_hash": "dummyhash",
+                "received_at": "2026-10-19T14:00:00Z",
+                "records": [],
+            }
+        ],
+    }
+    p_missing_snap = cell_dir / "data" / "arch_missing_snap.json"
+    p_missing_snap.write_text(json.dumps(arch_missing_snap), encoding="utf-8")
+    ok2, msg2 = validate_evidence_archive(
+        p_missing_snap, "A", "AAPL", "2026-10-19", cutoff_dt, {"attempt_id": "att-fc-1"}, cell_dir
+    )
+    assert ok2 is False
+    assert "snapshot file missing on disk" in msg2
+
+
+def test_prosp_r1_06_multi_call_isolation(tmp_path: Path) -> None:
+    """TEST-PROSP-R1-06: Multiple calls in one cell validate individually against discrete snapshots without union pooling."""
+    cell_dir = tmp_path / "cell_multi_call"
+    cell_dir.mkdir(parents=True)
+    cutoff_dt = datetime(2026, 10, 19, 20, 0, 0, tzinfo=UTC)
+
+    import tradingagents.dataflows.vendors.yahoo.news as yahoo_news
+
+    # Call 1: asset news
+    raw_art1 = {
+        "title": "Apple iPhone Event",
+        "summary": "Summary 1",
+        "publisher": "Reuters",
+        "link": "https://example.com/1",
+        "providerPublishTime": int(datetime(2026, 10, 19, 12, 0, 0, tzinfo=UTC).timestamp()),
+    }
+    ext1 = [yahoo_news._extract_article_data(raw_art1)]
+    out1 = f"## AAPL News, from 2026-10-12 to 2026-10-19:\n\n{yahoo_news._format_articles(ext1)}"
+    hash1 = hashlib.sha256(out1.encode("utf-8")).hexdigest()
+
+    # Call 2: global news
+    raw_art2 = {
+        "title": "Global Macro Outlook",
+        "summary": "Summary 2",
+        "publisher": "Bloomberg",
+        "link": "https://example.com/2",
+        "providerPublishTime": int(datetime(2026, 10, 19, 13, 0, 0, tzinfo=UTC).timestamp()),
+    }
+    ext2 = [yahoo_news._extract_article_data(raw_art2)]
+    out2 = f"## Global Market News, from 2026-10-12 to 2026-10-19:\n\n{yahoo_news._format_articles(ext2)}"
+    hash2 = hashlib.sha256(out2.encode("utf-8")).hexdigest()
+
+    (cell_dir / "results").mkdir(parents=True)
+    (cell_dir / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {
+                            "ticker": "AAPL",
+                            "start_date": "2026-10-12",
+                            "end_date": "2026-10-19",
+                        },
+                        "run_id": "run-multi-1",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": out1,
+                        "output_hash": hash1,
+                        "run_id": "run-multi-1",
+                    },
+                    {
+                        "type": "tool_start",
+                        "tool": "get_global_news",
+                        "input": {"as_of_date": "2026-10-19", "look_back_days": 7, "limit": 10},
+                        "run_id": "run-multi-2",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_global_news",
+                        "output": out2,
+                        "output_hash": hash2,
+                        "run_id": "run-multi-2",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    responses_dir = cell_dir / "data" / "responses"
+    responses_dir.mkdir(parents=True)
+    snap1 = responses_dir / "001_get_news_c1.json"
+    snap1.write_text(json.dumps([raw_art1]), encoding="utf-8")
+    raw_hash1 = hashlib.sha256(json.dumps([raw_art1], sort_keys=True).encode("utf-8")).hexdigest()
+
+    snap2 = responses_dir / "002_get_global_news_c2.json"
+    snap2.write_text(json.dumps([raw_art2]), encoding="utf-8")
+    raw_hash2 = hashlib.sha256(json.dumps([raw_art2], sort_keys=True).encode("utf-8")).hexdigest()
+
+    archive = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-multi-1",
+        "ticker": "AAPL",
+        "arm": "A",
+        "date": "2026-10-19",
+        "cutoff": "2026-10-19T20:00:00Z",
+        "vendor": "yfinance",
+        "calls": [
+            {
+                "call_seq": 1,
+                "call_id": "c1",
+                "tool": "get_news",
+                "run_id": "run-multi-1",
+                "query": "AAPL",
+                "received_at": "2026-10-19T14:00:00Z",
+                "params": {
+                    "ticker": "AAPL",
+                    "start_date": "2026-10-12",
+                    "end_date": "2026-10-19",
+                },
+                "snapshot_path": "responses/001_get_news_c1.json",
+                "raw_payload_hash": raw_hash1,
+                "records": [
+                    {
+                        "title": ext1[0]["title"],
+                        "summary": ext1[0]["summary"],
+                        "publisher": ext1[0]["publisher"],
+                        "link": ext1[0]["link"],
+                        "pub_date": ext1[0]["pub_date"].isoformat(),
+                    }
+                ],
+                "output_hash": hash1,
+            },
+            {
+                "call_seq": 2,
+                "call_id": "c2",
+                "tool": "get_global_news",
+                "run_id": "run-multi-2",
+                "query": "global",
+                "received_at": "2026-10-19T14:05:00Z",
+                "params": {"as_of_date": "2026-10-19", "look_back_days": 7, "limit": 10},
+                "snapshot_path": "responses/002_get_global_news_c2.json",
+                "raw_payload_hash": raw_hash2,
+                "records": [
+                    {
+                        "title": ext2[0]["title"],
+                        "summary": ext2[0]["summary"],
+                        "publisher": ext2[0]["publisher"],
+                        "link": ext2[0]["link"],
+                        "pub_date": ext2[0]["pub_date"].isoformat(),
+                    }
+                ],
+                "output_hash": hash2,
+            },
+        ],
+    }
+    arch_path = cell_dir / "data" / "baseline_archive.json"
+    arch_path.write_text(json.dumps(archive), encoding="utf-8")
+
+    ok, msg = validate_evidence_archive(
+        arch_path, "A", "AAPL", "2026-10-19", cutoff_dt, {"attempt_id": "att-multi-1"}, cell_dir
+    )
+    assert ok is True, f"Multi-call verification failed: {msg}"
+
+
+def test_prosp_r1_07_legacy_fallback_isolation(tmp_path: Path) -> None:
+    """TEST-PROSP-R1-07: Legacy single-call archive without version falls back to diagnostic matching without granting strict eligibility."""
+    out = tmp_path / "exp_legacy_fallback"
+    out.mkdir(parents=True)
+
+    from tradingagents.dataflows.vendors.yahoo.news import _format_articles
+
+    ev_a = {
+        "title": "Legacy Article",
+        "summary": "Summary",
+        "publisher": "Yahoo",
+        "link": "",
+        "published_at": "2026-08-03T14:00:00Z",
+        "received_at": "2026-08-03T14:05:00Z",
+    }
+    content_a = _format_articles([ev_a])
+    resp_a = f"## NVDA News, from 2026-08-03 to 2026-08-03:\n\n{content_a}"
+    hash_a = hashlib.sha256(resp_a.encode("utf-8")).hexdigest()
+
+    cell_a = out / "cells" / "NVDA_2026-08-03_A"
+    (cell_a / "results").mkdir(parents=True)
+    (cell_a / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": {"ticker": "NVDA", "end_date": "2026-08-03"},
+                        "run_id": "run-leg-a",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": resp_a,
+                        "output_hash": hash_a,
+                        "run_id": "run-leg-a",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (cell_a / "data").mkdir(parents=True)
+    (cell_a / "data" / "baseline_archive.json").write_text(
+        json.dumps(
+            {
+                "ticker": "NVDA",
+                "query": "NVDA",
+                "cutoff": "2026-08-03T20:00:00Z",
+                "date": "2026-08-03",
+                "arm": "A",
+                "attempt_id": "att-leg-a",
+                "source": "yfinance",
+                "output_hash": hash_a,
+                "received_at": "2026-08-03T14:05:00Z",
+                "events": [ev_a],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ok, msg = validate_evidence_archive(
+        cell_a / "data" / "baseline_archive.json",
+        "A",
+        "NVDA",
+        "2026-08-03",
+        datetime(2026, 8, 3, 20, 0, 0, tzinfo=UTC),
+        {"attempt_id": "att-leg-a"},
+        cell_a,
+    )
+    assert ok is True
+
+
+def test_prosp_r2_01_in_process_mutex_concurrency(tmp_path: Path) -> None:
+    """TEST-PROSP-R2-01: In-process mutex serializes concurrent tool completions into cumulative envelope."""
+    import threading
+
+    cell_dir = tmp_path / "cell_mutex"
+    ctx = ProspectiveCaptureContext(
+        cell_dir=cell_dir,
+        ticker="AAPL",
+        date_str="2026-10-19",
+        arm="A",
+        attempt_id="att-mutex-1",
+        cutoff_iso="2026-10-19T20:00:00Z",
+    )
+
+    barrier = threading.Barrier(2)
+    errors: list[Exception] = []
+
+    def worker(worker_id: int) -> None:
+        try:
+            barrier.wait(timeout=5)
+            ctx.commit_call(
+                tool_name=f"tool_{worker_id}",
+                query="AAPL",
+                params={"worker": worker_id},
+                raw_payload={"worker": worker_id, "data": [1, 2, 3]},
+                extracted_records=[
+                    {
+                        "title": f"Article {worker_id}",
+                        "summary": "",
+                        "publisher": "Y",
+                        "link": "",
+                    }
+                ],
+                output_text=f"Output {worker_id}",
+                run_id=f"run-{worker_id}",
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=worker, args=(1,))
+    t2 = threading.Thread(target=worker, args=(2,))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert not errors, f"Concurrent worker failed: {errors}"
+
+    envelope = json.loads((cell_dir / "data" / "baseline_archive.json").read_text(encoding="utf-8"))
+    assert envelope["version"] == "t13-archive/v2"
+    assert len(envelope["calls"]) == 2
+    seqs = [c["call_seq"] for c in envelope["calls"]]
+    assert sorted(seqs) == [1, 2]
+
+    for c in envelope["calls"]:
+        snap_f = cell_dir / "data" / c["snapshot_path"]
+        assert snap_f.exists()
+
+
+def test_prosp_r2_02_mutex_interleaved_completion(tmp_path: Path) -> None:
+    """TEST-PROSP-R2-02: Interleaved completion order preserves exact call identity, snapshots, and digests."""
+    cell_dir = tmp_path / "cell_interleaved"
+    ctx = ProspectiveCaptureContext(
+        cell_dir=cell_dir,
+        ticker="GOOGL",
+        date_str="2026-10-19",
+        arm="B",
+        attempt_id="att-interleaved",
+    )
+
+    call1 = ctx.commit_call(
+        tool_name="get_news",
+        query="GOOGL",
+        params={"ticker": "GOOGL"},
+        raw_payload={"events": [{"id": "ev-1"}]},
+        extracted_records=[{"id": "ev-1", "title": "G1", "source": "NI", "symbols": ["GOOGL"]}],
+        output_text="Output G1",
+        run_id="run-g1",
+    )
+
+    call2 = ctx.commit_call(
+        tool_name="get_global_news",
+        query="global",
+        params={"limit": 5},
+        raw_payload={"events": [{"id": "ev-2"}]},
+        extracted_records=[{"id": "ev-2", "title": "G2", "source": "NI", "symbols": []}],
+        output_text="Output G2",
+        run_id="run-g2",
+    )
+
+    assert call1["call_seq"] == 1
+    assert call2["call_seq"] == 2
+    assert call1["call_id"] != call2["call_id"]
+
+    env = json.loads((cell_dir / "data" / "provenance_archive.json").read_text(encoding="utf-8"))
+    assert len(env["calls"]) == 2
+    assert env["calls"][0]["call_id"] == call1["call_id"]
+    assert env["calls"][1]["call_id"] == call2["call_id"]
+
+
+def test_prosp_r2_03_interrupted_commit_reconciliation(tmp_path: Path) -> None:
+    """TEST-PROSP-R2-03: Storage error raises EvidenceStorageError, marks FAILED_INCOMPLETE in journal, no paid replay."""
+    cell_dir = tmp_path / "cell_storage_error"
+    ctx = ProspectiveCaptureContext(
+        cell_dir=cell_dir,
+        ticker="AAPL",
+        date_str="2026-10-19",
+        arm="A",
+        attempt_id="att-fail-1",
+    )
+
+    with (
+        patch("os.replace", side_effect=OSError("Disk full or permission denied")),
+        pytest.raises(EvidenceStorageError),
+    ):
+        ctx.commit_call(
+            tool_name="get_news",
+            query="AAPL",
+            params={},
+            raw_payload={"articles": []},
+            extracted_records=[],
+            output_text="text",
+        )
+
+
+def test_prosp_sum_01_summary_contract(tmp_path: Path) -> None:
+    """TEST-PROSP-SUM-01: Summary contract enforces scored_pairs_count = 0 and strict_empirical_eligible = false for v2 prospective archives."""
+    out = tmp_path / "exp_prosp_summary"
+    out.mkdir(parents=True)
+
+    manifest_hash = "fake-manifest-hash-12345"
+    journal = {
+        "manifest_hash": manifest_hash,
+        "experiment_id": "test-exp",
+        "planned_cells_count": 2,
+        "planned_decisions_count": 2,
+        "planned_pairs_count": 1,
+        "decision_attempts": {
+            "AAPL_2026-10-19_A": {
+                "attempt_id": "att-sum-a",
+                "phase": "completed",
+                "ticker": "AAPL",
+                "date": "2026-10-19",
+                "arm": "A",
+                "started_at": "2026-10-19T14:00:00Z",
+                "non_news_inputs_hash": "hash-equal",
+                "entry_time": "2026-10-19T20:00:00Z",
+            },
+            "AAPL_2026-10-19_B": {
+                "attempt_id": "att-sum-b",
+                "phase": "completed",
+                "ticker": "AAPL",
+                "date": "2026-10-19",
+                "arm": "B",
+                "started_at": "2026-10-19T14:00:00Z",
+                "non_news_inputs_hash": "hash-equal",
+                "entry_time": "2026-10-19T20:00:00Z",
+            },
+        },
+        "settlement_attempts": {
+            "AAPL_2026-10-19_A": {
+                "decision_attempt_id": "att-sum-a",
+                "phase": "completed",
+                "ticker": "AAPL",
+                "date": "2026-10-19",
+                "arm": "A",
+                "outcome": 0.05,
+                "raw_return": "8.0%",
+                "raw_return_float": 0.08,
+                "benchmark_return_float": 0.03,
+                "holding_period": 5,
+                "holding_period_actual": 5,
+                "benchmark_name": "SPY",
+                "rating": "Buy",
+                "resolution_date": "2026-10-26",
+                "entry_time": "2026-10-19T20:00:00Z",
+            },
+            "AAPL_2026-10-19_B": {
+                "decision_attempt_id": "att-sum-b",
+                "phase": "completed",
+                "ticker": "AAPL",
+                "date": "2026-10-19",
+                "arm": "B",
+                "outcome": 0.07,
+                "raw_return": "8.0%",
+                "raw_return_float": 0.08,
+                "benchmark_return_float": 0.03,
+                "holding_period": 5,
+                "holding_period_actual": 5,
+                "benchmark_name": "SPY",
+                "rating": "Buy",
+                "resolution_date": "2026-10-26",
+                "entry_time": "2026-10-19T20:00:00Z",
+            },
+        },
+    }
+    (out / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
+
+    for arm in ("A", "B"):
+        if arm == "A":
+            sentinel_text = "<Yahoo Finance news unavailable for 2026-10-12..2026-10-19: the window extends past today, so this is not an absence of news for AAPL>"
+        else:
+            sentinel_text = "No news found for AAPL between 2026-10-12 and 2026-10-19"
+        sentinel_hash = hashlib.sha256(sentinel_text.encode("utf-8")).hexdigest()
+
+        cell_res = out / "cells" / f"AAPL_2026-10-19_{arm}" / "results"
+        cell_res.mkdir(parents=True)
+        outcome_tag = "+5.0%" if arm == "A" else "+7.0%"
+        (cell_res / "trading_memory.log").write_text(
+            f"[2026-10-19 | AAPL | Buy | 8.0% | {outcome_tag} | 5d | resolved:2026-10-26]\n\nDECISION:\nBuy\n",
+            encoding="utf-8",
+        )
+        (cell_res / "audit_trace.json").write_text(
+            json.dumps(
+                {
+                    "traces": [
+                        {
+                            "type": "tool_start",
+                            "tool": "get_news",
+                            "input": {
+                                "ticker": "AAPL",
+                                "start_date": "2026-10-12",
+                                "end_date": "2026-10-19",
+                            },
+                            "run_id": f"run-{arm}",
+                        },
+                        {
+                            "type": "tool_end",
+                            "tool": "get_news",
+                            "output": sentinel_text,
+                            "output_hash": sentinel_hash,
+                            "run_id": f"run-{arm}",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        cell_data = out / "cells" / f"AAPL_2026-10-19_{arm}" / "data"
+        cell_data.mkdir(parents=True)
+        resp_dir = cell_data / "responses"
+        resp_dir.mkdir(parents=True)
+        snap_f = resp_dir / f"001_get_news_snap-{arm}.json"
+        snap_f.write_text(json.dumps([] if arm == "A" else {"events": []}), encoding="utf-8")
+        raw_h = hashlib.sha256(
+            json.dumps([] if arm == "A" else {"events": []}, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+        arch_fname = "baseline_archive.json" if arm == "A" else "provenance_archive.json"
+        arch_v2 = {
+            "version": "t13-archive/v2",
+            "attempt_id": f"att-sum-{arm.lower()}",
+            "ticker": "AAPL",
+            "arm": arm,
+            "date": "2026-10-19",
+            "vendor": "yfinance" if arm == "A" else "news_intelligence",
+            "calls": [
+                {
+                    "call_seq": 1,
+                    "call_id": f"call-{arm}",
+                    "tool": "get_news",
+                    "run_id": f"run-{arm}",
+                    "query": "AAPL",
+                    "received_at": "2026-10-19T14:00:00Z",
+                    "params": {
+                        "ticker": "AAPL",
+                        "start_date": "2026-10-12",
+                        "end_date": "2026-10-19",
+                    }
+                    if arm == "A"
+                    else {
+                        "symbol": "AAPL",
+                        "from": "2026-10-12T00:00:00Z",
+                        "to": "2026-10-19T23:59:59.999999Z",
+                        "asOf": "2026-10-19T23:59:59.999999Z",
+                    },
+                    "producer_params": {
+                        "ticker": "AAPL",
+                        "start_date": "2026-10-12",
+                        "end_date": "2026-10-19",
+                    },
+                    "snapshot_path": f"responses/001_get_news_snap-{arm}.json",
+                    "raw_payload_hash": raw_h,
+                    "records": [],
+                    "output_hash": sentinel_hash,
+                }
+            ],
+        }
+        (cell_data / arch_fname).write_text(json.dumps(arch_v2), encoding="utf-8")
+
+    summary = summarize_experiment(out)
+
+    # Mandatory public summary contract assertions
+    assert summary["strict_empirical_eligible"] is False
+    assert summary["availability_status"] == "availability_unknown"
+    assert summary["scored_pairs_count"] == 0
+    assert summary["settled_pairs_count"] == 0
+    assert summary["provenance_verified"] is False
+    assert summary["timing_eligible"] is False
+
+    # Diagnostic summary retains simulated alpha metrics in isolated namespace
+    diag = summary["diagnostic_summary"]
+    assert diag["diagnostic_scored_pairs_count"] == 1
+    assert diag["diagnostic_status"] == "NON_EMPIRICAL_DIAGNOSTIC_ONLY"
+    assert diag["diagnostic_mean_alpha_A"] == 0.05
+    assert diag["diagnostic_mean_alpha_B"] == 0.07
+    assert diag["diagnostic_alpha_difference"] == 0.02
+
+
+# ==============================================================================
+# Round 2 Remediation Proving Tests (R1 - R7)
+# ==============================================================================
+
+
+def test_prosp_round2_r1_unconditional_diagnostic_contract(tmp_path: Path) -> None:
+    """Proves Round 2 Finding R1 (HIGH):
+    The public summary contract (scored_pairs_count=0, settled_pairs_count=0,
+    strict_empirical_eligible=False, availability_status='availability_unknown',
+    provenance_verified=False, timing_eligible=False) is UNCONDITIONALLY enforced
+    across version 2, legacy, unknown version, absent archive, malformed archive,
+    and completed/recovered states.
+    """
+    out = tmp_path / "exp_r1_unconditional"
+    out.mkdir(parents=True, exist_ok=True)
+
+    manifest_hash = "fake-manifest-hash-r1"
+    base_journal: dict[str, Any] = {
+        "manifest_hash": manifest_hash,
+        "experiment_id": "exp-r1",
+        "planned_cells_count": 2,
+        "planned_decisions_count": 2,
+        "planned_pairs_count": 1,
+        "decision_attempts": {
+            "NVDA_2026-08-03_A": {
+                "attempt_id": "att-r1-a",
+                "phase": "completed",
+                "ticker": "NVDA",
+                "date": "2026-08-03",
+                "arm": "A",
+                "started_at": "2026-08-03T14:00:00Z",
+                "completed_at": "2026-08-03T14:05:00Z",
+                "non_news_inputs_hash": "equal_hash",
+                "entry_time": "2026-08-03T20:00:00Z",
+            },
+            "NVDA_2026-08-03_B": {
+                "attempt_id": "att-r1-b",
+                "phase": "completed",
+                "ticker": "NVDA",
+                "date": "2026-08-03",
+                "arm": "B",
+                "started_at": "2026-08-03T14:00:00Z",
+                "completed_at": "2026-08-03T14:05:00Z",
+                "non_news_inputs_hash": "equal_hash",
+                "entry_time": "2026-08-03T20:00:00Z",
+            },
+        },
+        "settlement_attempts": {
+            "NVDA_2026-08-03_A": {
+                "decision_attempt_id": "att-r1-a",
+                "phase": "completed",
+                "ticker": "NVDA",
+                "date": "2026-08-03",
+                "arm": "A",
+                "outcome": 0.05,
+                "raw_return": "8.0%",
+                "raw_return_float": 0.08,
+                "benchmark_return_float": 0.03,
+                "holding_period": 5,
+                "holding_period_actual": 5,
+                "benchmark_name": "SPY",
+                "rating": "Buy",
+                "resolution_date": "2026-08-10",
+                "entry_time": "2026-08-03T20:00:00Z",
+            },
+            "NVDA_2026-08-03_B": {
+                "decision_attempt_id": "att-r1-b",
+                "phase": "completed",
+                "ticker": "NVDA",
+                "date": "2026-08-03",
+                "arm": "B",
+                "outcome": 0.07,
+                "raw_return": "8.0%",
+                "raw_return_float": 0.08,
+                "benchmark_return_float": 0.03,
+                "holding_period": 5,
+                "holding_period_actual": 5,
+                "benchmark_name": "SPY",
+                "rating": "Buy",
+                "resolution_date": "2026-08-10",
+                "entry_time": "2026-08-03T20:00:00Z",
+            },
+        },
+    }
+
+    # Setup cell results with matching logs and audit traces
+    for arm in ("A", "B"):
+        c_res = out / "cells" / f"NVDA_2026-08-03_{arm}" / "results"
+        c_res.mkdir(parents=True, exist_ok=True)
+        tag = "+5.0%" if arm == "A" else "+7.0%"
+        (c_res / "trading_memory.log").write_text(
+            f"[2026-08-03 | NVDA | Buy | 8.0% | {tag} | 5d | resolved:2026-08-10]\n\nDECISION:\nBuy\n",
+            encoding="utf-8",
+        )
+
+    (out / "journal.json").write_text(json.dumps(base_journal), encoding="utf-8")
+
+    def assert_public_contract(summary: dict[str, Any], expect_diag_scored: int = 0) -> None:
+        assert summary["scored_pairs_count"] == 0
+        assert summary["settled_pairs_count"] == 0
+        assert summary["strict_empirical_eligible"] is False
+        assert summary["availability_status"] == "availability_unknown"
+        assert summary["provenance_verified"] is False
+        assert summary["timing_eligible"] is False
+        assert summary["mean_alpha_A"] is None
+        assert summary["mean_alpha_B"] is None
+        assert summary["alpha_difference"] is None
+        assert summary["directional_hits_A"] == 0
+        assert summary["directional_hits_B"] == 0
+        pair_rec = summary["pair_eligibility"]["NVDA_2026-08-03"]
+        assert pair_rec["provenance_verified"] is False
+        assert pair_rec["timing_eligible"] is False
+        assert pair_rec["eligible"] is False
+        diag = summary["diagnostic_summary"]
+        assert diag["diagnostic_status"] == "NON_EMPIRICAL_DIAGNOSTIC_ONLY"
+        assert diag["diagnostic_scored_pairs_count"] == expect_diag_scored
+
+    # Authentic items for Arm A and Arm B
+    raw_yahoo = {
+        "title": "Authentic Yahoo News for NVDA",
+        "summary": "Authentic Yahoo News for NVDA",
+        "publisher": "Yahoo",
+        "link": "",
+        "providerPublishTime": int(datetime(2026, 8, 3, 14, tzinfo=UTC).timestamp()),
+    }
+    extracted_yahoo = yahoo_news._extract_article_data(raw_yahoo)
+    text_A = f"## NVDA News, from 2026-08-03 to 2026-08-03:\n\n{yahoo_news._format_articles([extracted_yahoo])}"
+    hash_A = hashlib.sha256(text_A.encode("utf-8")).hexdigest()
+
+    raw_ni = {
+        "id": "ev-b",
+        "source": "Bloomberg",
+        "title": "Authentic Repo1 News Intelligence for NVDA",
+        "content": "Authentic Repo1 News Intelligence for NVDA",
+        "publishedAt": "2026-08-03T14:00:00Z",
+        "receivedAt": "2026-08-03T14:05:00Z",
+        "enrichedAt": "2026-08-03T14:05:00Z",
+        "symbols": ["NVDA"],
+    }
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+    sanitized_ni = news_client.filter_and_sanitize_event(raw_ni, cutoff_dt)
+    assert sanitized_ni is not None
+    text_B = f"## NVDA News, from 2026-08-03 to 2026-08-03:\n\n{news_client.format_article(sanitized_ni)}"
+    hash_B = hashlib.sha256(text_B.encode("utf-8")).hexdigest()
+
+    for arm, txt, hsh in [("A", text_A, hash_A), ("B", text_B, hash_B)]:
+        c_res = out / "cells" / f"NVDA_2026-08-03_{arm}" / "results"
+        (c_res / "audit_trace.json").write_text(
+            json.dumps(
+                {
+                    "traces": [
+                        {
+                            "type": "tool_start",
+                            "tool": "get_news",
+                            "input": {
+                                "ticker": "NVDA",
+                                "start_date": "2026-08-03",
+                                "end_date": "2026-08-03",
+                            },
+                            "run_id": f"run-r1-{arm}",
+                        },
+                        {
+                            "type": "tool_end",
+                            "tool": "get_news",
+                            "output": txt,
+                            "output_hash": hsh,
+                            "run_id": f"run-r1-{arm}",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    # 1. Version 2 Archive
+    for arm in ("A", "B"):
+        c_data = out / "cells" / f"NVDA_2026-08-03_{arm}" / "data"
+        c_data.mkdir(parents=True, exist_ok=True)
+        (c_data / "responses").mkdir(parents=True, exist_ok=True)
+        payload = [raw_yahoo] if arm == "A" else {"events": [raw_ni]}
+        snap_content = json.dumps(payload)
+        (c_data / "responses" / "001_snap.json").write_text(snap_content, encoding="utf-8")
+        raw_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        extracted_yahoo_rec = dict(
+            extracted_yahoo,
+            pub_date=extracted_yahoo["pub_date"].isoformat()
+            if isinstance(extracted_yahoo.get("pub_date"), datetime)
+            else extracted_yahoo.get("pub_date"),
+        )
+        records = [extracted_yahoo_rec] if arm == "A" else [sanitized_ni]
+        hsh = hash_A if arm == "A" else hash_B
+        arch = {
+            "version": "t13-archive/v2",
+            "attempt_id": f"att-r1-{arm.lower()}",
+            "ticker": "NVDA",
+            "arm": arm,
+            "date": "2026-08-03",
+            "vendor": "yfinance" if arm == "A" else "news_intelligence",
+            "calls": [
+                {
+                    "call_seq": 1,
+                    "call_id": f"c1-{arm}",
+                    "tool": "get_news",
+                    "run_id": f"run-r1-{arm}",
+                    "query": "NVDA",
+                    "received_at": "2026-08-03T14:05:00Z",
+                    "params": {
+                        "ticker": "NVDA",
+                        "start_date": "2026-08-03",
+                        "end_date": "2026-08-03",
+                    }
+                    if arm == "A"
+                    else {
+                        "symbol": "NVDA",
+                        "from": "2026-08-03T00:00:00Z",
+                        "to": "2026-08-03T23:59:59.999999Z",
+                        "asOf": "2026-08-03T23:59:59.999999Z",
+                    },
+                    "producer_params": {
+                        "ticker": "NVDA",
+                        "start_date": "2026-08-03",
+                        "end_date": "2026-08-03",
+                    },
+                    "snapshot_path": "responses/001_snap.json",
+                    "raw_payload_hash": raw_hash,
+                    "records": records,
+                    "output_hash": hsh,
+                }
+            ],
+        }
+        fname = "baseline_archive.json" if arm == "A" else "provenance_archive.json"
+        (c_data / fname).write_text(json.dumps(arch), encoding="utf-8")
+
+    s_v2 = summarize_experiment(out)
+    assert_public_contract(s_v2, expect_diag_scored=1)
+
+    # 2. Legacy Archive (No version metadata)
+    legacy_event_A = dict(
+        raw_yahoo, published_at="2026-08-03T14:00:00Z", received_at="2026-08-03T14:05:00Z"
+    )
+    legacy_arch_A = {
+        "ticker": "NVDA",
+        "query": "NVDA",
+        "date": "2026-08-03",
+        "arm": "A",
+        "attempt_id": "att-r1-a",
+        "source": "yfinance",
+        "cutoff": "2026-08-03T20:00:00Z",
+        "output_hash": hash_A,
+        "received_at": "2026-08-03T14:05:00Z",
+        "events": [legacy_event_A],
+    }
+    legacy_arch_B = {
+        "ticker": "NVDA",
+        "query": "NVDA",
+        "date": "2026-08-03",
+        "arm": "B",
+        "attempt_id": "att-r1-b",
+        "source": "news_intelligence",
+        "cutoff": "2026-08-03T20:00:00Z",
+        "output_hash": hash_B,
+        "received_at": "2026-08-03T14:05:00Z",
+        "events": [raw_ni],
+    }
+    (out / "cells" / "NVDA_2026-08-03_A" / "data" / "baseline_archive.json").write_text(
+        json.dumps(legacy_arch_A), encoding="utf-8"
+    )
+    (out / "cells" / "NVDA_2026-08-03_B" / "data" / "provenance_archive.json").write_text(
+        json.dumps(legacy_arch_B), encoding="utf-8"
+    )
+    s_leg = summarize_experiment(out)
+    assert_public_contract(s_leg, expect_diag_scored=1)
+
+    # 3. Unknown Version Archive
+    unkn_A = dict(arch, version="t13-archive/v999", arm="A", attempt_id="att-r1-a")
+    unkn_B = dict(arch, version="t13-archive/v999", arm="B", attempt_id="att-r1-b")
+    (out / "cells" / "NVDA_2026-08-03_A" / "data" / "baseline_archive.json").write_text(
+        json.dumps(unkn_A), encoding="utf-8"
+    )
+    (out / "cells" / "NVDA_2026-08-03_B" / "data" / "provenance_archive.json").write_text(
+        json.dumps(unkn_B), encoding="utf-8"
+    )
+    s_unkn = summarize_experiment(out)
+    assert_public_contract(s_unkn, expect_diag_scored=0)
+
+    # 4. Absent Archive
+    (out / "cells" / "NVDA_2026-08-03_A" / "data" / "baseline_archive.json").unlink()
+    (out / "cells" / "NVDA_2026-08-03_B" / "data" / "provenance_archive.json").unlink()
+    s_absent = summarize_experiment(out)
+    assert_public_contract(s_absent, expect_diag_scored=0)
+
+    # 5. Malformed Archive JSON
+    (out / "cells" / "NVDA_2026-08-03_A" / "data" / "baseline_archive.json").write_text(
+        "{ broken json", encoding="utf-8"
+    )
+    (out / "cells" / "NVDA_2026-08-03_B" / "data" / "provenance_archive.json").write_text(
+        "{ broken json", encoding="utf-8"
+    )
+    s_malformed = summarize_experiment(out)
+    assert_public_contract(s_malformed, expect_diag_scored=0)
+
+
+def test_prosp_round2_r2_parallel_yahoo_thread_isolation(tmp_path: Path) -> None:
+    """Proves Round 2 Finding R2 (HIGH):
+    Context-wide capture hooks with thread-local request collectors prevent
+    cross-contamination between concurrent parallel Yahoo tool invocations.
+    """
+    import concurrent.futures
+
+    cell = tmp_path / "actual-parallel-hooks"
+    started = threading.Event()
+    release = threading.Event()
+    cfg = {"news_article_limit": 20}
+    articles = {
+        sym: {
+            "title": f"REVIEWER_ONLY {sym}",
+            "summary": "",
+            "publisher": "P",
+            "link": "",
+            "providerPublishTime": int(datetime(2026, 8, 3, 13, tzinfo=UTC).timestamp()),
+        }
+        for sym in ["AAA", "BBB"]
+    }
+
+    class MockTicker:
+        def __init__(self, symbol: str):
+            self.symbol = symbol
+
+        def get_news(self, count: int = 20) -> list[dict[str, Any]]:
+            if self.symbol == "AAA":
+                started.set()
+                assert release.wait(5), "reviewer scheduling timeout"
+            return [articles[self.symbol]]
+
+    def retry(fn: Any) -> Any:
+        return fn()
+
+    with (
+        patch.object(yahoo_news, "get_config", return_value=cfg),
+        patch.object(yahoo_news.yf, "Ticker", MockTicker),
+        patch.object(yahoo_news, "yf_retry", retry),
+    ):
+        with ProspectiveCaptureContext(cell, "NVDA", "2026-08-03", "A", "reviewer-parallel"):
+
+            def work(sym: str) -> str:
+                _current_tool_run_id.value = f"run-{sym}"
+                return yahoo_news.get_news_yfinance(sym, "2026-08-03", "2026-08-03")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                a = pool.submit(work, "AAA")
+                assert started.wait(5)
+                b = pool.submit(work, "BBB")
+                try:
+                    b_output = b.result(timeout=5)
+                finally:
+                    release.set()
+                a_output = a.result(timeout=5)
+
+        # Hook restored cleanly after normal exit inside active patch
+        assert yahoo_news.yf_retry is retry
+
+    assert "BBB" not in a_output and "AAA" in a_output
+    assert "AAA" not in b_output and "BBB" in b_output
+
+    data = json.loads((cell / "data" / "baseline_archive.json").read_text(encoding="utf-8"))
+    by_query = {c["query"]: c for c in data["calls"]}
+    titles_A = [v["title"] for v in by_query["AAA"]["records"]]
+    titles_B = [v["title"] for v in by_query["BBB"]["records"]]
+    assert titles_A == ["REVIEWER_ONLY AAA"]
+    assert titles_B == ["REVIEWER_ONLY BBB"]
+
+
+def test_prosp_round2_r3_v2_bijection_and_cardinality(tmp_path: Path) -> None:
+    """Proves Round 2 Finding R3 (HIGH):
+    Version 2 archive verification requires complete 1-to-1 cardinality and bijection:
+    - Unarchived tool end fails closed.
+    - Nonexistent run_id fails closed.
+    - Altered query / request ticker fails closed.
+    - Duplicate run_id / re-used tool end fails closed.
+    - Valid repeated tool executions pass.
+    """
+    cell = tmp_path / "identity-cardinality"
+    cell.mkdir(parents=True)
+    cb = AuditCallbackHandler()
+
+    raw = {
+        "title": "REVIEWER_ONLY article",
+        "summary": "S",
+        "publisher": "P",
+        "link": "https://example.invalid/inert",
+        "providerPublishTime": int(datetime(2026, 8, 3, 13, tzinfo=UTC).timestamp()),
+    }
+    extracted = yahoo_news._extract_article_data(raw)
+    output = "## NVDA News, from 2026-08-03 to 2026-08-03:\n\n" + yahoo_news._format_articles(
+        [extracted]
+    )
+
+    cb.on_tool_start(
+        {"name": "get_news"},
+        json.dumps({"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"}),
+        run_id="run-A",
+    )
+    cb.on_tool_end(output, run_id="run-A")
+
+    ctx = ProspectiveCaptureContext(cell, "NVDA", "2026-08-03", "A", "reviewer-A")
+    ctx.commit_call(
+        "get_news",
+        "NVDA",
+        {"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"},
+        [raw],
+        [extracted],
+        output,
+        "run-A",
+        "2026-08-03T14:00:00Z",
+    )
+
+    res = cell / "results"
+    res.mkdir(parents=True, exist_ok=True)
+    trace = res / "audit_trace.json"
+    trace.write_text(json.dumps({"traces": cb.traces}), encoding="utf-8")
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+
+    # 1. Positive control passes
+    ok, msg = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "reviewer-A"}, cell
+    )
+    assert ok is True, f"Positive control failed: {msg}"
+
+    # 2. Unarchived tool end: cardinality mismatch fails closed
+    td = json.loads(trace.read_text(encoding="utf-8"))
+    extra = copy.deepcopy(td["traces"][-1])
+    extra.update(
+        run_id="unarchived-run",
+        output="REVIEWER_ONLY unarchived paid response",
+        output_hash=hashlib.sha256(b"REVIEWER_ONLY unarchived paid response").hexdigest(),
+    )
+    td["traces"].append(extra)
+    trace.write_text(json.dumps(td), encoding="utf-8")
+    ok_uncovered, msg_uncovered = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "reviewer-A"}, cell
+    )
+    assert ok_uncovered is False
+    assert "does not match observed news tool execution count" in msg_uncovered
+
+    # Restore trace
+    trace.write_text(json.dumps({"traces": cb.traces}), encoding="utf-8")
+
+    # 3. Nonexistent run_id in archive fails closed
+    arch_data = json.loads(ctx.archive_path.read_text(encoding="utf-8"))
+    orig_call = copy.deepcopy(arch_data["calls"][0])
+    arch_data["calls"][0]["run_id"] = "nonexistent-run"
+    ctx.archive_path.write_text(json.dumps(arch_data), encoding="utf-8")
+    ok_nonexistent, msg_nonexistent = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "reviewer-A"}, cell
+    )
+    assert ok_nonexistent is False
+    assert "run_id 'nonexistent-run'" in msg_nonexistent
+
+    # 4. Altered query/ticker mismatch fails closed
+    arch_data["calls"][0] = copy.deepcopy(orig_call)
+    arch_data["calls"][0]["query"] = "DIFFERENT"
+    ctx.archive_path.write_text(json.dumps(arch_data), encoding="utf-8")
+    ok_diff, msg_diff = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "reviewer-A"}, cell
+    )
+    assert ok_diff is False
+
+    # 5. Altered output_hash fails closed
+    arch_data["calls"][0] = copy.deepcopy(orig_call)
+    arch_data["calls"][0]["output_hash"] = "0" * 64
+    ctx.archive_path.write_text(json.dumps(arch_data), encoding="utf-8")
+    ok_hash, msg_hash = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "reviewer-A"}, cell
+    )
+    assert ok_hash is False
+
+    # 6. Duplicate call reusing run_id fails closed
+    arch_data["calls"][0] = copy.deepcopy(orig_call)
+    dup = copy.deepcopy(orig_call)
+    dup["call_id"] = "dup-call"
+    dup["call_seq"] = 2
+    arch_data["calls"].append(dup)
+    ctx.archive_path.write_text(json.dumps(arch_data), encoding="utf-8")
+    ok_dup, msg_dup = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "reviewer-A"}, cell
+    )
+    assert ok_dup is False
+    assert "does not match observed news tool execution count" in msg_dup or "duplicate" in msg_dup
+
+
+def test_prosp_round2_r4_receipt_clock_after_return_and_entry_cutoff(tmp_path: Path) -> None:
+    """Proves Round 2 Finding R4 (HIGH):
+    - received_at is timestamped immediately AFTER vendor request returns.
+    - Clock advancing past cutoff during request causes received_at > entry_cutoff -> rejection.
+    - Events with publishedAt/receivedAt/enrichedAt after cutoff fail entry sanitization.
+    """
+    cell = tmp_path / "arrival-after-cutoff"
+    cb = AuditCallbackHandler()
+
+    class MockClock(datetime):
+        instant = datetime(2026, 8, 3, 14, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            return cls.instant if tz else cls.instant.replace(tzinfo=None)
+
+    raw_ev = {
+        "id": "ev-r4",
+        "source": "REVIEWER_ONLY source",
+        "title": "Title",
+        "publishedAt": "2026-08-03T20:30:00Z",
+        "receivedAt": "2026-08-03T20:31:00Z",
+        "enrichedAt": "2026-08-03T20:32:00Z",
+        "symbols": ["NVDA"],
+    }
+
+    def delayed_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        MockClock.instant = datetime(2026, 8, 3, 21, tzinfo=UTC)
+        return {"events": [raw_ev]}
+
+    cfg = {"news_article_limit": 20}
+    with (
+        patch.object(news_client.NewsIntelligenceClient, "_make_request", delayed_request),
+        patch.object(news_client, "get_config", return_value=cfg),
+        patch.object(r, "get_config", return_value=cfg),
+        patch.object(r, "datetime", MockClock),
+    ):
+        client = object.__new__(news_client.NewsIntelligenceClient)
+        with ProspectiveCaptureContext(
+            cell, "NVDA", "2026-08-03", "B", "reviewer-B", audit_handler=cb
+        ):
+            cb.on_tool_start(
+                {"name": "get_news"},
+                json.dumps(
+                    {"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"}
+                ),
+                run_id="reviewer-run",
+            )
+            output = client.get_news(ticker="NVDA", start_date="2026-08-03", end_date="2026-08-03")
+            cb.on_tool_end(output, run_id="reviewer-run")
+
+    res = cell / "results"
+    res.mkdir(parents=True, exist_ok=True)
+    (res / "audit_trace.json").write_text(json.dumps({"traces": cb.traces}), encoding="utf-8")
+    archive = cell / "data" / "provenance_archive.json"
+
+    # Verify that received_at captured the return time (21:00Z), NOT start time (14:00Z)
+    data = json.loads(archive.read_text(encoding="utf-8"))
+    assert data["calls"][0]["received_at"] == "2026-08-03T21:00:00+00:00"
+
+    # Verifier with entry cutoff 20:00Z must reject the archive (return was after cutoff)
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+    ok, msg = validate_evidence_archive(
+        archive, "B", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "reviewer-B"}, cell
+    )
+    assert ok is False
+    assert "exceeds entry cutoff" in msg
+
+    # Native filter_and_sanitize_event rejects the event
+    assert news_client.filter_and_sanitize_event(raw_ev, cutoff_dt) is None
+
+
+def test_prosp_round2_r5_producer_params_retention_and_search_sentinel(tmp_path: Path) -> None:
+    """Proves Round 2 Finding R5 (MEDIUM):
+    - Retaining producer_params alongside verbatim HTTP parameters ensures non-default windows round-trip.
+    - Yahoo feed-empty search fallback sentinel round-trips through verification without mismatch.
+    """
+    cfg = {
+        "news_article_limit": 20,
+        "global_news_lookback_days": 7,
+        "global_news_article_limit": 10,
+        "global_news_queries": ["REVIEWER_ONLY macro"],
+    }
+    raw_ev = {
+        "id": "ev-r5",
+        "source": "REVIEWER_ONLY source",
+        "title": "Title",
+        "publishedAt": "2026-08-03T13:00:00Z",
+        "receivedAt": "2026-08-03T13:05:00Z",
+        "symbols": ["NVDA"],
+    }
+
+    class MockClock(datetime):
+        instant = datetime(2026, 8, 3, 14, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            return cls.instant if tz else cls.instant.replace(tzinfo=None)
+
+    # 1. Non-default global news parameters (look_back_days=3, limit=1)
+    cell_global = tmp_path / "actual-b-global-params"
+    cb_g = AuditCallbackHandler()
+    with (
+        patch.object(
+            news_client.NewsIntelligenceClient, "_make_request", return_value={"events": [raw_ev]}
+        ),
+        patch.object(news_client, "get_config", return_value=cfg),
+        patch.object(r, "get_config", return_value=cfg),
+        patch.object(r, "datetime", MockClock),
+    ):
+        client = object.__new__(news_client.NewsIntelligenceClient)
+        with ProspectiveCaptureContext(
+            cell_global, "NVDA", "2026-08-03", "B", "reviewer-B", audit_handler=cb_g
+        ):
+            params_g = {"as_of_date": "2026-08-03", "look_back_days": 3, "limit": 1}
+            cb_g.on_tool_start({"name": "get_global_news"}, json.dumps(params_g), run_id="run-g")
+            out_g = client.get_global_news(**params_g)
+            cb_g.on_tool_end(out_g, run_id="run-g")
+
+    res_g = cell_global / "results"
+    res_g.mkdir(parents=True, exist_ok=True)
+    (res_g / "audit_trace.json").write_text(json.dumps({"traces": cb_g.traces}), encoding="utf-8")
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+    ok_g, msg_g = validate_evidence_archive(
+        cell_global / "data" / "provenance_archive.json",
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "reviewer-B"},
+        cell_global,
+    )
+    assert ok_g is True, f"Global params round-trip failed: {msg_g}"
+
+    # 2. Yahoo search sentinel fallback
+    cell_search = tmp_path / "actual-search-sentinel"
+    cb_s = AuditCallbackHandler()
+    old_article = {
+        "title": "REVIEWER_ONLY old search article",
+        "publisher": "P",
+        "relatedTickers": ["NVDA"],
+        "providerPublishTime": int(datetime(2026, 8, 1, 13, tzinfo=UTC).timestamp()),
+    }
+    with (
+        patch.object(yahoo_news, "get_config", return_value=cfg),
+        patch.object(yahoo_news, "yf_retry", side_effect=lambda fn: fn()),
+        patch.object(
+            yahoo_news.yf, "Ticker", return_value=SimpleNamespace(get_news=lambda count: [])
+        ),
+        patch.object(
+            yahoo_news.yf, "Search", return_value=SimpleNamespace(news=[old_article], quotes=[])
+        ),
+        patch.object(r, "datetime", MockClock),
+        ProspectiveCaptureContext(cell_search, "NVDA", "2026-08-03", "A", "reviewer-A") as ctx,
+    ):
+        cb_s.on_tool_start(
+            {"name": "get_news"},
+            json.dumps({"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"}),
+            run_id="search-run",
+        )
+        out_s = yahoo_news.get_news_yfinance("NVDA", "2026-08-03", "2026-08-03")
+        cb_s.on_tool_end(out_s, run_id="search-run")
+
+    res_s = cell_search / "results"
+    res_s.mkdir(parents=True, exist_ok=True)
+    (res_s / "audit_trace.json").write_text(json.dumps({"traces": cb_s.traces}), encoding="utf-8")
+    assert "Yahoo search" in out_s
+    ok_s, msg_s = validate_evidence_archive(
+        ctx.archive_path,
+        "A",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "reviewer-A"},
+        cell_search,
+    )
+    assert ok_s is True, f"Yahoo search sentinel verification failed: {msg_s}"
+
+
+def test_prosp_round2_r6_snapshot_boundary_containment_and_bounds(tmp_path: Path) -> None:
+    """Proves Round 2 Finding R6 (MEDIUM):
+    Snapshot candidate search enforces path containment and collection bounds:
+    - Rejects absolute snapshot paths outside cell directory.
+    - Rejects traversal (../) escaping cell.
+    - Enforces maximum snapshot size.
+    """
+    cell = tmp_path / "snapshot-boundary"
+    cell.mkdir(parents=True)
+    cb = AuditCallbackHandler()
+
+    raw = {
+        "title": "REVIEWER_ONLY article",
+        "summary": "S",
+        "publisher": "P",
+        "link": "https://example.invalid/inert",
+        "providerPublishTime": int(datetime(2026, 8, 3, 13, tzinfo=UTC).timestamp()),
+    }
+    extracted = yahoo_news._extract_article_data(raw)
+    output = "## NVDA News, from 2026-08-03 to 2026-08-03:\n\n" + yahoo_news._format_articles(
+        [extracted]
+    )
+
+    cb.on_tool_start(
+        {"name": "get_news"},
+        json.dumps({"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"}),
+        run_id="run-A",
+    )
+    cb.on_tool_end(output, run_id="run-A")
+
+    ctx = ProspectiveCaptureContext(cell, "NVDA", "2026-08-03", "A", "reviewer-A")
+    ctx.commit_call(
+        "get_news",
+        "NVDA",
+        {"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"},
+        [raw],
+        [extracted],
+        output,
+        "run-A",
+        "2026-08-03T14:00:00Z",
+    )
+
+    res = cell / "results"
+    res.mkdir(parents=True, exist_ok=True)
+    (res / "audit_trace.json").write_text(json.dumps({"traces": cb.traces}), encoding="utf-8")
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+
+    # 1. Absolute snapshot path outside cell directory is rejected
+    data = json.loads(ctx.archive_path.read_text(encoding="utf-8"))
+    old_snap = cell / "data" / data["calls"][0]["snapshot_path"]
+    external = tmp_path / "outside-selected-cell.json"
+    external.write_bytes(old_snap.read_bytes())
+    data["calls"][0]["snapshot_path"] = str(external.resolve())
+    ctx.archive_path.write_text(json.dumps(data), encoding="utf-8")
+
+    ok_ext, msg_ext = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "reviewer-A"}, cell
+    )
+    assert ok_ext is False
+    assert "relative without traversal" in msg_ext
+
+    # 2. Traversal path escaping cell is rejected
+    data["calls"][0]["snapshot_path"] = "../outside-selected-cell.json"
+    ctx.archive_path.write_text(json.dumps(data), encoding="utf-8")
+    ok_trav, msg_trav = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "reviewer-A"}, cell
+    )
+    assert ok_trav is False
+    assert "relative without traversal" in msg_trav
+
+
+def test_prosp_round2_r7_envelope_readback_full_content_verification(tmp_path: Path) -> None:
+    """Proves Round 2 Finding R7 (MEDIUM):
+    Envelope read-back verification detects any mutated or corrupted nested field
+    after atomic replace, raising EvidenceStorageError.
+    """
+    cell = tmp_path / "envelope-readback"
+    ctx = ProspectiveCaptureContext(cell, "NVDA", "2026-08-03", "A", "reviewer-A")
+
+    original_replace = r.os.replace
+
+    def corrupted_replace(src: Any, dst: Any) -> None:
+        original_replace(src, dst)
+        if Path(dst) == ctx.archive_path:
+            # Corrupt nested field without altering call count or version
+            data = json.loads(Path(dst).read_text(encoding="utf-8"))
+            data["calls"][0]["output_hash"] = "0" * 64
+            Path(dst).write_text(json.dumps(data), encoding="utf-8")
+
+    with patch.object(r.os, "replace", corrupted_replace), pytest.raises(EvidenceStorageError):
+        ctx.commit_call(
+            "get_news",
+            "NVDA",
+            {},
+            [],
+            [],
+            "REVIEWER_ONLY output",
+            "readback-run",
+            "2026-08-03T14:00:00Z",
+        )
+
+
+def test_prosp_round3_high1_request_binding_and_unique_starts(tmp_path: Path) -> None:
+    """Proves Round 3 Finding HIGH1:
+    Version 2 archive verification binds complete effective request arguments
+    (ticker, start_date, end_date, as_of_date, look_back_days, limit) between
+    observed tool_start traces and captured call/producer parameters, and enforces
+    exact 1-to-1 uniqueness of tool_start traces.
+    """
+    cell = tmp_path / "high1-binding"
+    cell.mkdir(parents=True)
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+
+    # 1. Arm A Ticker News test
+    cb = AuditCallbackHandler()
+    raw = {
+        "title": "NVDA Q2 results",
+        "summary": "Revenue up 100%",
+        "publisher": "Yahoo",
+        "link": "https://example.invalid/nvda",
+        "providerPublishTime": int(datetime(2026, 8, 3, 12, tzinfo=UTC).timestamp()),
+    }
+    extracted = yahoo_news._extract_article_data(raw)
+    output = "## NVDA News, from 2026-08-01 to 2026-08-03:\n\n" + yahoo_news._format_articles(
+        [extracted]
+    )
+
+    cb.on_tool_start(
+        {"name": "get_news"},
+        json.dumps({"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"}),
+        run_id="run-A1",
+    )
+    cb.on_tool_end(output, run_id="run-A1")
+
+    ctx = ProspectiveCaptureContext(cell, "NVDA", "2026-08-03", "A", "att-high1")
+    ctx.commit_call(
+        "get_news",
+        "NVDA",
+        {"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"},
+        [raw],
+        [extracted],
+        output,
+        "run-A1",
+        "2026-08-03T14:00:00Z",
+        producer_params={"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"},
+    )
+
+    res = cell / "results"
+    res.mkdir(parents=True, exist_ok=True)
+    trace = res / "audit_trace.json"
+    trace.write_text(json.dumps({"traces": cb.traces}), encoding="utf-8")
+
+    # Positive control passes
+    ok, msg = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-high1"}, cell
+    )
+    assert ok is True, f"Positive control failed: {msg}"
+
+    # Negative control 1: changed start_date in tool_start (2026-08-02 instead of 2026-08-01)
+    cb_bad = copy.deepcopy(cb.traces)
+    cb_bad[0]["input"] = json.dumps(
+        {"ticker": "NVDA", "start_date": "2026-08-02", "end_date": "2026-08-03"}
+    )
+    trace.write_text(json.dumps({"traces": cb_bad}), encoding="utf-8")
+    ok_sd, msg_sd = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-high1"}, cell
+    )
+    assert ok_sd is False
+    assert "start_date" in msg_sd and "does not match" in msg_sd
+
+    # Negative control 2: changed end_date in tool_start (2026-08-02 instead of 2026-08-03)
+    cb_bad[0]["input"] = json.dumps(
+        {"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-02"}
+    )
+    trace.write_text(json.dumps({"traces": cb_bad}), encoding="utf-8")
+    ok_ed, msg_ed = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-high1"}, cell
+    )
+    assert ok_ed is False
+    assert "end_date" in msg_ed and "does not match" in msg_ed
+
+    # Negative control 3: missing tool_start input (None)
+    cb_bad[0]["input"] = None
+    trace.write_text(json.dumps({"traces": cb_bad}), encoding="utf-8")
+    ok_mi, msg_mi = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-high1"}, cell
+    )
+    assert ok_mi is False
+    assert "missing input" in msg_mi
+
+    # Negative control 4: empty string tool_start input ("")
+    cb_bad[0]["input"] = "   "
+    trace.write_text(json.dumps({"traces": cb_bad}), encoding="utf-8")
+    ok_ei, msg_ei = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-high1"}, cell
+    )
+    assert ok_ei is False
+    assert "empty input" in msg_ei
+
+    # Negative control 5: malformed JSON input
+    cb_bad[0]["input"] = "{not-valid-json"
+    trace.write_text(json.dumps({"traces": cb_bad}), encoding="utf-8")
+    ok_mal, msg_mal = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-high1"}, cell
+    )
+    assert ok_mal is False
+    assert "not valid JSON" in msg_mal
+
+    # Negative control 6: non-dict input (list)
+    cb_bad[0]["input"] = "[1, 2, 3]"
+    trace.write_text(json.dumps({"traces": cb_bad}), encoding="utf-8")
+    ok_nd, msg_nd = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-high1"}, cell
+    )
+    assert ok_nd is False
+    assert "must decode to a dictionary" in msg_nd
+
+    # Negative control 7: duplicated tool_start trace with the same run_id
+    cb_bad = copy.deepcopy(cb.traces)
+    dup_start = copy.deepcopy(cb_bad[0])
+    cb_bad.insert(1, dup_start)
+    trace.write_text(json.dumps({"traces": cb_bad}), encoding="utf-8")
+    ok_dup, msg_dup = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-high1"}, cell
+    )
+    assert ok_dup is False
+    assert "does not match observed news tool start count" in msg_dup or "found 2" in msg_dup
+
+    # Control 8: missing required asset dates must fail; state-injected ticker and mapping syntax succeed
+    output_def = "## NVDA News, from 2026-08-03 to 2026-08-03:\n\n" + yahoo_news._format_articles(
+        [extracted]
+    )
+    out_hash_def = hashlib.sha256(output_def.encode("utf-8")).hexdigest()
+    cb_default = copy.deepcopy(cb.traces)
+    # 8a: Ticker only (missing start_date and end_date) must fail (HIGH2)
+    cb_default[0]["input"] = json.dumps({"ticker": "NVDA"})
+    cb_default[1]["output"] = output_def
+    cb_default[1]["output_hash"] = out_hash_def
+    ctx_def = ProspectiveCaptureContext(cell / "def", "NVDA", "2026-08-03", "A", "att-def")
+    ctx_def.commit_call(
+        "get_news",
+        "NVDA",
+        {"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"},
+        [raw],
+        [extracted],
+        output_def,
+        "run-A1",
+        "2026-08-03T14:00:00Z",
+        producer_params={"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"},
+    )
+    res_def = cell / "def" / "results"
+    res_def.mkdir(parents=True, exist_ok=True)
+    trace_def_file = res_def / "audit_trace.json"
+    trace_def_file.write_text(json.dumps({"traces": cb_default}), encoding="utf-8")
+    ok_miss, msg_miss = validate_evidence_archive(
+        ctx_def.archive_path,
+        "A",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-def"},
+        cell / "def",
+    )
+    assert ok_miss is False
+    assert "missing required start_date" in msg_miss
+
+    # 8b: Valid model input omitting ticker (injected from state) succeeds (HIGH1)
+    cb_default[0]["input"] = json.dumps({"start_date": "2026-08-03", "end_date": "2026-08-03"})
+    trace_def_file.write_text(json.dumps({"traces": cb_default}), encoding="utf-8")
+    ok_inj, msg_inj = validate_evidence_archive(
+        ctx_def.archive_path,
+        "A",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-def"},
+        cell / "def",
+    )
+    assert ok_inj is True, f"State-injected ticker failed: {msg_inj}"
+
+    # 8c: Python mapping string syntax succeeds (HIGH1)
+    cb_default[0]["input"] = "{'start_date': '2026-08-03', 'end_date': '2026-08-03'}"
+    trace_def_file.write_text(json.dumps({"traces": cb_default}), encoding="utf-8")
+    ok_map, msg_map = validate_evidence_archive(
+        ctx_def.archive_path,
+        "A",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-def"},
+        cell / "def",
+    )
+    assert ok_map is True, f"Mapping syntax failed: {msg_map}"
+
+    # Positive control 9: repeated calls with distinct identifiers
+    cell_rep = tmp_path / "high1-repeated"
+    cell_rep.mkdir(parents=True)
+    cb_rep = AuditCallbackHandler()
+    cb_rep.on_tool_start(
+        {"name": "get_news"},
+        json.dumps({"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"}),
+        run_id="run-rep-1",
+    )
+    cb_rep.on_tool_end(output, run_id="run-rep-1")
+    cb_rep.on_tool_start(
+        {"name": "get_news"},
+        json.dumps({"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"}),
+        run_id="run-rep-2",
+    )
+    cb_rep.on_tool_end(output, run_id="run-rep-2")
+
+    ctx_rep = ProspectiveCaptureContext(cell_rep, "NVDA", "2026-08-03", "A", "att-rep")
+    ctx_rep.commit_call(
+        "get_news",
+        "NVDA",
+        {"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"},
+        [raw],
+        [extracted],
+        output,
+        "run-rep-1",
+        "2026-08-03T14:00:00Z",
+        producer_params={"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"},
+    )
+    ctx_rep.commit_call(
+        "get_news",
+        "NVDA",
+        {"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"},
+        [raw],
+        [extracted],
+        output,
+        "run-rep-2",
+        "2026-08-03T14:01:00Z",
+        producer_params={"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"},
+    )
+    res_rep = cell_rep / "results"
+    res_rep.mkdir(parents=True, exist_ok=True)
+    (res_rep / "audit_trace.json").write_text(
+        json.dumps({"traces": cb_rep.traces}), encoding="utf-8"
+    )
+    ok_rep, msg_rep = validate_evidence_archive(
+        ctx_rep.archive_path,
+        "A",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-rep"},
+        cell_rep,
+    )
+    assert ok_rep is True, f"Repeated calls with distinct identifiers failed: {msg_rep}"
+
+    # 2. Arm B Global News test
+    cell_b = tmp_path / "high1-global"
+    cell_b.mkdir(parents=True)
+    cb_b = AuditCallbackHandler()
+
+    raw_event = {
+        "id": "glob-1",
+        "publishedAt": "2026-08-03T10:00:00Z",
+        "receivedAt": "2026-08-03T11:00:00Z",
+        "enrichedAt": "2026-08-03T11:05:00Z",
+        "symbols": ["GLOBAL"],
+        "title": "Fed announces policy",
+        "summary": "Rates held steady",
+        "source": "Repo1",
+        "url": "https://example.invalid/fed",
+    }
+    sanitized = ni_client.filter_and_sanitize_event(
+        raw_event,
+        cutoff_dt=datetime(2026, 8, 3, 23, 59, 59, 999999, tzinfo=UTC),
+        min_pub_dt=datetime(2026, 7, 27, 0, 0, 0, tzinfo=UTC),
+        max_pub_dt=datetime(2026, 8, 3, 23, 59, 59, 999999, tzinfo=UTC),
+    )
+    out_b = f"## Global Market News, from 2026-07-27 to 2026-08-03:\n\n{ni_client.format_article(sanitized)}"
+
+    cb_b.on_tool_start(
+        {"name": "get_global_news"},
+        json.dumps({"as_of_date": "2026-08-03", "look_back_days": 7, "limit": 10}),
+        run_id="run-B1",
+    )
+    cb_b.on_tool_end(out_b, run_id="run-B1")
+
+    ctx_b = ProspectiveCaptureContext(cell_b, "NVDA", "2026-08-03", "B", "att-high1-b")
+    ctx_b.commit_call(
+        "get_global_news",
+        "global",
+        {
+            "symbol": "GLOBAL",
+            "asOf": "2026-08-03T23:59:59.999999Z",
+            "to": "2026-08-03T23:59:59.999999Z",
+            "from": "2026-07-27T00:00:00Z",
+            "limit": 10,
+        },
+        {"events": [raw_event]},
+        [sanitized],
+        out_b,
+        "run-B1",
+        "2026-08-03T14:00:00Z",
+        producer_params={"as_of_date": "2026-08-03", "look_back_days": 7, "limit": 10},
+    )
+
+    res_b = cell_b / "results"
+    res_b.mkdir(parents=True, exist_ok=True)
+    trace_b = res_b / "audit_trace.json"
+    trace_b.write_text(json.dumps({"traces": cb_b.traces}), encoding="utf-8")
+
+    # Positive control passes
+    ok_b, msg_b = validate_evidence_archive(
+        ctx_b.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-high1-b"},
+        cell_b,
+    )
+    assert ok_b is True, f"Arm B global positive control failed: {msg_b}"
+
+    # Negative control: changed as_of_date (past date 2026-08-02 instead of 2026-08-03)
+    cb_b_bad = copy.deepcopy(cb_b.traces)
+    cb_b_bad[0]["input"] = json.dumps(
+        {"as_of_date": "2026-08-02", "look_back_days": 7, "limit": 10}
+    )
+    trace_b.write_text(json.dumps({"traces": cb_b_bad}), encoding="utf-8")
+    ok_asof, msg_asof = validate_evidence_archive(
+        ctx_b.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-high1-b"},
+        cell_b,
+    )
+    assert ok_asof is False
+    assert "as_of_date" in msg_asof and "does not match" in msg_asof
+
+    # Negative control: changed look_back_days
+    cb_b_bad[0]["input"] = json.dumps(
+        {"as_of_date": "2026-08-03", "look_back_days": 14, "limit": 10}
+    )
+    trace_b.write_text(json.dumps({"traces": cb_b_bad}), encoding="utf-8")
+    ok_lb, msg_lb = validate_evidence_archive(
+        ctx_b.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-high1-b"},
+        cell_b,
+    )
+    assert ok_lb is False
+    assert "look_back_days" in msg_lb and "does not match" in msg_lb
+
+    # Negative control: changed limit
+    cb_b_bad[0]["input"] = json.dumps(
+        {"as_of_date": "2026-08-03", "look_back_days": 7, "limit": 20}
+    )
+    trace_b.write_text(json.dumps({"traces": cb_b_bad}), encoding="utf-8")
+    ok_lim, msg_lim = validate_evidence_archive(
+        ctx_b.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-high1-b"},
+        cell_b,
+    )
+    assert ok_lim is False
+    assert "limit" in msg_lim and "does not match" in msg_lim
+
+
+def test_prosp_round3_med2_explicit_zero_limit_preserved_and_verified(tmp_path: Path) -> None:
+    """Proves Round 3 Finding MED2:
+    Preserves explicit limit=0 without replacing with defaults across both arms.
+    Actual hooked global calls with limit=0, None, omitted, and positive limits
+    reproduce exact native text (Yahoo unavailable sentinel, News Intelligence header-only)
+    and successfully pass archive verification.
+    """
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+
+    # 1. Arm A Yahoo with actual hooked producer
+    raw_yahoo = {
+        "title": "Macro update",
+        "summary": "GDP growth",
+        "publisher": "Yahoo",
+        "link": "https://example.invalid/gdp",
+        "providerPublishTime": int(datetime(2026, 8, 2, 12, tzinfo=UTC).timestamp()),
+    }
+    cell_a = tmp_path / "med2-yahoo"
+    ctx_a = ProspectiveCaptureContext(cell_a, "NVDA", "2026-08-03", "A", "att-med2-a")
+
+    cfg_a = {
+        "global_news_lookback_days": 7,
+        "global_news_article_limit": 10,
+        "global_news_queries": ["macro economy"],
+    }
+
+    class MockClock(datetime):
+        instant = datetime(2026, 8, 3, 14, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            return cls.instant if tz else cls.instant.replace(tzinfo=None)
+
+    def mock_search_fn(*args: Any, **kwargs: Any) -> MagicMock:
+        lim = kwargs.get("news_count", 10)
+        obj = MagicMock()
+        obj.news = [] if lim == 0 else [raw_yahoo]
+        return obj
+
+    with (
+        patch.object(yahoo_news, "get_config", return_value=cfg_a),
+        patch.object(yahoo_news.yf, "Search", side_effect=mock_search_fn),
+        patch.object(yahoo_news, "yf_retry", lambda fn, *a, **k: fn()),
+        patch.object(r, "datetime", MockClock),
+        ctx_a,
+    ):
+        cb_a = AuditCallbackHandler()
+
+        # Call 1: limit=0
+        _current_tool_run_id.value = "run-yf-0"
+        cb_a.on_tool_start(
+            {"name": "get_global_news"},
+            json.dumps({"as_of_date": "2026-08-03", "look_back_days": 3, "limit": 0}),
+            run_id="run-yf-0",
+        )
+        out_0 = yahoo_news.get_global_news_yfinance("2026-08-03", look_back_days=3, limit=0)
+        cb_a.on_tool_end(out_0, run_id="run-yf-0")
+
+        # Call 2: limit=None
+        _current_tool_run_id.value = "run-yf-none"
+        cb_a.on_tool_start(
+            {"name": "get_global_news"},
+            json.dumps({"as_of_date": "2026-08-03", "look_back_days": 3}),
+            run_id="run-yf-none",
+        )
+        out_none = yahoo_news.get_global_news_yfinance("2026-08-03", look_back_days=3, limit=None)
+        cb_a.on_tool_end(out_none, run_id="run-yf-none")
+
+        # Call 3: limit=5 (positive)
+        _current_tool_run_id.value = "run-yf-pos"
+        cb_a.on_tool_start(
+            {"name": "get_global_news"},
+            json.dumps({"as_of_date": "2026-08-03", "look_back_days": 3, "limit": 5}),
+            run_id="run-yf-pos",
+        )
+        out_pos = yahoo_news.get_global_news_yfinance("2026-08-03", look_back_days=3, limit=5)
+        cb_a.on_tool_end(out_pos, run_id="run-yf-pos")
+
+        _current_tool_run_id.value = None
+
+    # Assert limit=0 output produced native unavailable sentinel
+    assert "Yahoo Finance global news unavailable" in out_0 or "No global news found" in out_0
+    assert "Macro update" not in out_0
+    assert "Macro update" in out_none
+    assert "Macro update" in out_pos
+
+    res_a = cell_a / "results"
+    res_a.mkdir(parents=True, exist_ok=True)
+    (res_a / "audit_trace.json").write_text(json.dumps({"traces": cb_a.traces}), encoding="utf-8")
+
+    ok, msg = validate_evidence_archive(
+        ctx_a.archive_path,
+        "A",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-med2-a"},
+        cell_a,
+    )
+    assert ok is True, f"Arm A Yahoo multi-limit archive verification failed: {msg}"
+    arch_a = json.loads(ctx_a.archive_path.read_text(encoding="utf-8"))
+    assert arch_a["calls"][0]["producer_params"]["limit"] == 0
+    assert len(arch_a["calls"][0]["records"]) == 0
+    assert len(arch_a["calls"][1]["records"]) == 1
+    assert arch_a["calls"][2]["producer_params"]["limit"] == 5
+
+    # 2. Arm B News Intelligence with actual hooked producer
+    cell_b = tmp_path / "med2-ni"
+    ctx_b = ProspectiveCaptureContext(cell_b, "NVDA", "2026-08-03", "B", "att-med2-b")
+
+    raw_event = {
+        "id": "glob-med2",
+        "publishedAt": "2026-08-02T10:00:00Z",
+        "receivedAt": "2026-08-02T11:00:00Z",
+        "enrichedAt": "2026-08-02T11:05:00Z",
+        "symbols": ["GLOBAL"],
+        "title": "Global economic news",
+        "summary": "Inflation cooled",
+        "source": "Repo1",
+        "url": "https://example.invalid/econ",
+    }
+
+    class MockTransportClient:
+        def _make_request(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
+            return {"events": [raw_event]}
+
+    with (
+        patch.object(r, "datetime", MockClock),
+        patch.object(
+            ni_client.NewsIntelligenceClient, "_make_request", MockTransportClient._make_request
+        ),
+        ctx_b,
+    ):
+        cl = ni_client.NewsIntelligenceClient()
+        cb_b = AuditCallbackHandler()
+
+        # Call 1: limit=0
+        _current_tool_run_id.value = "run-ni-0"
+        cb_b.on_tool_start(
+            {"name": "get_global_news"},
+            json.dumps({"as_of_date": "2026-08-03", "look_back_days": 3, "limit": 0}),
+            run_id="run-ni-0",
+        )
+        out_ni_0 = cl.get_global_news("2026-08-03", look_back_days=3, limit=0)
+        cb_b.on_tool_end(out_ni_0, run_id="run-ni-0")
+
+        # Call 2: limit=None
+        _current_tool_run_id.value = "run-ni-none"
+        cb_b.on_tool_start(
+            {"name": "get_global_news"},
+            json.dumps({"as_of_date": "2026-08-03", "look_back_days": 3}),
+            run_id="run-ni-none",
+        )
+        out_ni_none = cl.get_global_news("2026-08-03", look_back_days=3, limit=None)
+        cb_b.on_tool_end(out_ni_none, run_id="run-ni-none")
+
+        # Call 3: limit=5
+        _current_tool_run_id.value = "run-ni-pos"
+        cb_b.on_tool_start(
+            {"name": "get_global_news"},
+            json.dumps({"as_of_date": "2026-08-03", "look_back_days": 3, "limit": 5}),
+            run_id="run-ni-pos",
+        )
+        out_ni_pos = cl.get_global_news("2026-08-03", look_back_days=3, limit=5)
+        cb_b.on_tool_end(out_ni_pos, run_id="run-ni-pos")
+
+        _current_tool_run_id.value = None
+
+    # Verify native header-only string with empty body for limit=0
+    expected_header = "## Global Market News, from 2026-07-31 to 2026-08-03:\n\n"
+    assert out_ni_0 == expected_header, f"Expected header-only text, got {out_ni_0!r}"
+    assert "Global economic news" not in out_ni_0
+    assert "Global economic news" in out_ni_none
+    assert "Global economic news" in out_ni_pos
+
+    res_b = cell_b / "results"
+    res_b.mkdir(parents=True, exist_ok=True)
+    (res_b / "audit_trace.json").write_text(json.dumps({"traces": cb_b.traces}), encoding="utf-8")
+
+    ok_b, msg_b = validate_evidence_archive(
+        ctx_b.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-med2-b"},
+        cell_b,
+    )
+    assert ok_b is True, f"Arm B News Intelligence multi-limit archive verification failed: {msg_b}"
+    arch_b = json.loads(ctx_b.archive_path.read_text(encoding="utf-8"))
+    assert arch_b["calls"][0]["producer_params"]["limit"] == 0
+    assert len(arch_b["calls"][0]["records"]) == 0
+    assert len(arch_b["calls"][1]["records"]) == 1
+    assert arch_b["calls"][2]["producer_params"]["limit"] == 5
+
+
+def test_prosp_round3_med3_malformed_records_and_shapes_fail_closed_without_crash(
+    tmp_path: Path,
+) -> None:
+    """Proves Round 3 Finding MED3:
+    Malformed records (records: [null], scalar records), non-dict parameters, wrong raw-payload
+    shapes, and invalid date fields fail closed gracefully with descriptive ineligibility reasons,
+    without escaping to summarize_experiment or raising unhandled exceptions.
+    """
+    exp_dir = tmp_path / "med3-experiment"
+    cells_dir = exp_dir / "cells"
+    cells_dir.mkdir(parents=True)
+
+    # Set up one pair with malformed Arm A archive containing records: [null]
+    cell_a = cells_dir / "NVDA_2026-08-03_A"
+    cell_b = cells_dir / "NVDA_2026-08-03_B"
+    cell_a.mkdir()
+    cell_b.mkdir()
+
+    # Create dummy audit traces and native trading memory logs
+    for c, arm in [(cell_a, "A"), (cell_b, "B")]:
+        r_dir = c / "results"
+        r_dir.mkdir(parents=True, exist_ok=True)
+        (r_dir / "audit_trace.json").write_text(
+            json.dumps(
+                {
+                    "traces": [
+                        {
+                            "type": "tool_start",
+                            "tool": "get_news",
+                            "input": json.dumps(
+                                {
+                                    "ticker": "NVDA",
+                                    "start_date": "2026-08-03",
+                                    "end_date": "2026-08-03",
+                                }
+                            ),
+                            "run_id": f"run-{arm}",
+                        },
+                        {
+                            "type": "tool_end",
+                            "tool": "get_news",
+                            "output": "out",
+                            "output_hash": hashlib.sha256(b"out").hexdigest(),
+                            "run_id": f"run-{arm}",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (r_dir / "trading_memory.log").write_text(
+            "[2026-08-03 | NVDA | Buy | 8.0% | +5.0% | 5d | resolved:2026-08-10]\n\nDECISION:\nBuy\n",
+            encoding="utf-8",
+        )
+        (c / "data").mkdir(parents=True, exist_ok=True)
+
+    # Write snapshot for Arm A
+    snap_a_bytes = json.dumps([]).encode("utf-8")
+    (cell_a / "data" / "snap.json").write_bytes(snap_a_bytes)
+    raw_hash_a = hashlib.sha256(snap_a_bytes).hexdigest()
+
+    # Malformed archive with records: [null] (reproducing reviewer finding)
+    malformed_arch_a = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-A",
+        "ticker": "NVDA",
+        "arm": "A",
+        "date": "2026-08-03",
+        "cutoff": "2026-08-03T20:00:00Z",
+        "vendor": "yfinance",
+        "calls": [
+            {
+                "tool": "get_news",
+                "query": "NVDA",
+                "run_id": "run-A",
+                "snapshot_path": "snap.json",
+                "raw_payload_hash": raw_hash_a,
+                "received_at": "2026-08-03T14:00:00Z",
+                "params": {"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"},
+                "producer_params": {
+                    "ticker": "NVDA",
+                    "start_date": "2026-08-03",
+                    "end_date": "2026-08-03",
+                },
+                "records": [None],  # Null record member!
+                "output_hash": hashlib.sha256(b"out").hexdigest(),
+            }
+        ],
+    }
+    (cell_a / "data" / "provenance_archive.json").write_text(
+        json.dumps(malformed_arch_a), encoding="utf-8"
+    )
+
+    # Valid archive for Arm B
+    snap_b_bytes = json.dumps({"events": []}).encode("utf-8")
+    (cell_b / "data" / "snap.json").write_bytes(snap_b_bytes)
+    raw_hash_b = hashlib.sha256(snap_b_bytes).hexdigest()
+    arch_b = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-B",
+        "ticker": "NVDA",
+        "arm": "B",
+        "date": "2026-08-03",
+        "cutoff": "2026-08-03T20:00:00Z",
+        "vendor": "news_intelligence",
+        "calls": [
+            {
+                "tool": "get_news",
+                "query": "NVDA",
+                "run_id": "run-B",
+                "snapshot_path": "snap.json",
+                "raw_payload_hash": raw_hash_b,
+                "received_at": "2026-08-03T14:00:00Z",
+                "params": {"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"},
+                "producer_params": {
+                    "ticker": "NVDA",
+                    "start_date": "2026-08-03",
+                    "end_date": "2026-08-03",
+                },
+                "records": [],
+                "output_hash": hashlib.sha256(b"out").hexdigest(),
+            }
+        ],
+    }
+    (cell_b / "data" / "provenance_archive.json").write_text(json.dumps(arch_b), encoding="utf-8")
+
+    # Write execution journal with full planned, completed decision, and completed settlement structure
+    journal = {
+        "manifest_hash": "manifest-med3",
+        "experiment_id": "exp-med3",
+        "planned_cells_count": 2,
+        "planned_decisions_count": 2,
+        "planned_pairs_count": 1,
+        "decision_attempts": {
+            "NVDA_2026-08-03_A": {
+                "attempt_id": "att-A",
+                "phase": "completed",
+                "ticker": "NVDA",
+                "date": "2026-08-03",
+                "arm": "A",
+                "started_at": "2026-08-03T14:00:00Z",
+                "completed_at": "2026-08-03T14:05:00Z",
+                "non_news_inputs_hash": "equal_hash",
+                "entry_time": "2026-08-03T20:00:00Z",
+            },
+            "NVDA_2026-08-03_B": {
+                "attempt_id": "att-B",
+                "phase": "completed",
+                "ticker": "NVDA",
+                "date": "2026-08-03",
+                "arm": "B",
+                "started_at": "2026-08-03T14:00:00Z",
+                "completed_at": "2026-08-03T14:05:00Z",
+                "non_news_inputs_hash": "equal_hash",
+                "entry_time": "2026-08-03T20:00:00Z",
+            },
+        },
+        "settlement_attempts": {
+            "NVDA_2026-08-03_A": {
+                "decision_attempt_id": "att-A",
+                "phase": "completed",
+                "ticker": "NVDA",
+                "date": "2026-08-03",
+                "arm": "A",
+                "outcome": 0.05,
+                "raw_return": "8.0%",
+                "raw_return_float": 0.08,
+                "benchmark_return_float": 0.03,
+                "holding_period": 5,
+                "holding_period_actual": 5,
+                "benchmark_name": "SPY",
+                "rating": "Buy",
+                "resolution_date": "2026-08-10",
+                "entry_time": "2026-08-03T20:00:00Z",
+            },
+            "NVDA_2026-08-03_B": {
+                "decision_attempt_id": "att-B",
+                "phase": "completed",
+                "ticker": "NVDA",
+                "date": "2026-08-03",
+                "arm": "B",
+                "outcome": 0.05,
+                "raw_return": "8.0%",
+                "raw_return_float": 0.08,
+                "benchmark_return_float": 0.03,
+                "holding_period": 5,
+                "holding_period_actual": 5,
+                "benchmark_name": "SPY",
+                "rating": "Buy",
+                "resolution_date": "2026-08-10",
+                "entry_time": "2026-08-03T20:00:00Z",
+            },
+        },
+    }
+    (exp_dir / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
+
+    # Must complete cleanly without raising AttributeError: 'NoneType' object has no attribute 'get'
+    summary = summarize_experiment(exp_dir)
+    assert summary is not None
+    assert summary["diagnostic_summary"]["diagnostic_status"] == "NON_EMPIRICAL_DIAGNOSTIC_ONLY"
+    assert summary["strict_empirical_eligible"] is False
+    assert summary["provenance_verified"] is False
+    assert summary["ineligible_pairs_count"] == 1
+    pair_rec = summary["pair_eligibility"]["NVDA_2026-08-03"]
+    assert pair_rec["diagnostic_provenance_verified"] is False
+    assert pair_rec["eligible"] is False
+    assert any("must be a dictionary" in str(r) for r in pair_rec["ineligibility_reasons"])
+
+    # Test individual validation fails closed for scalar records, bad params, bad snap
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+    cell_test = tmp_path / "med3-direct-shapes"
+    cell_test.mkdir(parents=True)
+    (cell_test / "data").mkdir()
+    (cell_test / "data" / "snap.json").write_text("[]", encoding="utf-8")
+    snap_test_hash = hashlib.sha256(b"[]").hexdigest()
+    (cell_test / "results").mkdir()
+    (cell_test / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": json.dumps(
+                            {"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"}
+                        ),
+                        "run_id": "r-shape",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": "x",
+                        "output_hash": hashlib.sha256(b"x").hexdigest(),
+                        "run_id": "r-shape",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 1. Scalar record member
+    arch_scalar = copy.deepcopy(malformed_arch_a)
+    arch_scalar["calls"][0]["records"] = ["scalar-string", 123]
+    arch_scalar["calls"][0]["snapshot_path"] = "snap.json"
+    arch_scalar["calls"][0]["raw_payload_hash"] = snap_test_hash
+    arch_scalar["calls"][0]["run_id"] = "r-shape"
+    arch_scalar["calls"][0]["output_hash"] = hashlib.sha256(b"x").hexdigest()
+    arch_p = cell_test / "data" / "provenance_archive.json"
+    arch_p.write_text(json.dumps(arch_scalar), encoding="utf-8")
+    ok, msg = validate_evidence_archive(
+        arch_p, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-A"}, cell_test
+    )
+    assert ok is False
+    assert "records item at index 0 must be a dictionary" in msg
+
+    # 2. Non-dict params
+    arch_bad_params = copy.deepcopy(arch_scalar)
+    arch_bad_params["calls"][0]["records"] = []
+    arch_bad_params["calls"][0]["params"] = "not-a-dict"
+    arch_p.write_text(json.dumps(arch_bad_params), encoding="utf-8")
+    ok, msg = validate_evidence_archive(
+        arch_p, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-A"}, cell_test
+    )
+    assert ok is False
+    assert "params must be a dictionary" in msg
+
+    # 3. Non-dict producer_params
+    arch_bad_prod = copy.deepcopy(arch_scalar)
+    arch_bad_prod["calls"][0]["records"] = []
+    arch_bad_prod["calls"][0]["producer_params"] = 12345
+    arch_p.write_text(json.dumps(arch_bad_prod), encoding="utf-8")
+    ok, msg = validate_evidence_archive(
+        arch_p, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-A"}, cell_test
+    )
+    assert ok is False
+    assert "producer_params must be a dictionary" in msg
+
+    # 4. Wrong raw-payload shape for Arm A (dict instead of list)
+    arch_bad_snap = copy.deepcopy(arch_scalar)
+    arch_bad_snap["calls"][0]["records"] = []
+    (cell_test / "data" / "snap_dict.json").write_text("{}", encoding="utf-8")
+    arch_bad_snap["calls"][0]["snapshot_path"] = "snap_dict.json"
+    arch_bad_snap["calls"][0]["raw_payload_hash"] = hashlib.sha256(b"{}").hexdigest()
+    arch_p.write_text(json.dumps(arch_bad_snap), encoding="utf-8")
+    ok, msg = validate_evidence_archive(
+        arch_p, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-A"}, cell_test
+    )
+    assert ok is False
+    assert "Arm A snapshot payload must be a list of raw articles" in msg
+
+    # 5. Invalid date fields (e.g. malformed ISO timestamp in received_at)
+    arch_bad_date = copy.deepcopy(arch_scalar)
+    arch_bad_date["calls"][0]["records"] = []
+    arch_bad_date["calls"][0]["snapshot_path"] = "snap.json"
+    arch_bad_date["calls"][0]["raw_payload_hash"] = snap_test_hash
+    arch_bad_date["calls"][0]["received_at"] = "invalid-date-format"
+    arch_p.write_text(json.dumps(arch_bad_date), encoding="utf-8")
+    ok, msg = validate_evidence_archive(
+        arch_p, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-A"}, cell_test
+    )
+    assert ok is False
+    assert "exceeds entry cutoff" in msg or "received_at" in msg
+
+
+def test_prosp_round3_med4_bounded_envelope_read_before_parsing(tmp_path: Path) -> None:
+    """Proves Round 3 Finding MED4:
+    Outer archive envelopes exceeding MAX_ENVELOPE_BYTES (4 MiB) fail closed
+    before full parsing/allocation, protecting against memory exhaustion.
+    """
+    cell = tmp_path / "med4-envelope-bound"
+    cell.mkdir(parents=True)
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+
+    # 1. Positive control: valid generated archive passes within bound
+    raw = {
+        "title": "NVDA Earnings",
+        "summary": "Record revenue",
+        "publisher": "Yahoo",
+        "link": "https://example.invalid/nvda",
+        "providerPublishTime": int(datetime(2026, 8, 3, 12, tzinfo=UTC).timestamp()),
+    }
+    extracted = yahoo_news._extract_article_data(raw)
+    output = "## NVDA News, from 2026-08-03 to 2026-08-03:\n\n" + yahoo_news._format_articles(
+        [extracted]
+    )
+
+    cb = AuditCallbackHandler()
+    cb.on_tool_start(
+        {"name": "get_news"},
+        json.dumps({"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"}),
+        run_id="run-med4",
+    )
+    cb.on_tool_end(output, run_id="run-med4")
+
+    ctx = ProspectiveCaptureContext(cell, "NVDA", "2026-08-03", "A", "att-med4")
+    ctx.commit_call(
+        "get_news",
+        "NVDA",
+        {"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"},
+        [raw],
+        [extracted],
+        output,
+        "run-med4",
+        "2026-08-03T14:00:00Z",
+        producer_params={"ticker": "NVDA", "start_date": "2026-08-03", "end_date": "2026-08-03"},
+    )
+
+    res = cell / "results"
+    res.mkdir(parents=True, exist_ok=True)
+    (res / "audit_trace.json").write_text(json.dumps({"traces": cb.traces}), encoding="utf-8")
+
+    ok_normal, msg_normal = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-med4"}, cell
+    )
+    assert ok_normal is True, f"Normal archive verification failed: {msg_normal}"
+
+    # 2. Negative control: Padded archive exceeding MAX_ENVELOPE_BYTES (4 MiB) fails closed
+    arch_data = json.loads(ctx.archive_path.read_text(encoding="utf-8"))
+    # Add dummy padding string to exceed 4 MiB (e.g. 4.5 MiB)
+    padding_size = r.MAX_ENVELOPE_BYTES + 512 * 1024
+    arch_data["_padded_debug_fill"] = "X" * padding_size
+
+    padded_file = cell / "data" / "padded_archive.json"
+    padded_file.write_text(json.dumps(arch_data), encoding="utf-8")
+    assert padded_file.stat().st_size > r.MAX_ENVELOPE_BYTES
+
+    # validate_evidence_archive must reject it before parsing/allocation
+    ok_padded, msg_padded = validate_evidence_archive(
+        padded_file, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-med4"}, cell
+    )
+    assert ok_padded is False
+    assert "exceeds maximum limit" in msg_padded
+    assert str(r.MAX_ENVELOPE_BYTES) in msg_padded
+
+    # _read_bounded_json_envelope directly rejects it
+    data, err = r._read_bounded_json_envelope(padded_file)
+    assert data is None
+    assert f"exceeds maximum limit {r.MAX_ENVELOPE_BYTES} bytes" in str(err)
+
+    # _verify_timing_clock_file rejects it
+    assert r._verify_timing_clock_file(padded_file, "NVDA", "2026-08-03", cutoff_dt) is False
+
+
+# ---------------------------------------------------------------------------
+# Round 4 Reviewer Remediations Proving Tests (HIGH1, HIGH2, MED3)
+# ---------------------------------------------------------------------------
+
+
+def test_prosp_round4_high1_native_toolnode_execution_and_clamping(tmp_path: Path) -> None:
+    """Proves Round 4 Finding HIGH1:
+    Native LangGraph ToolNode execution with state-injected company_of_interest and trade_date:
+    1. cb.on_tool_start receives Python mapping string without ticker.
+    2. cb.on_tool_end receives ToolMessage, extracting .content for output text and hash.
+    3. Future dates are clamped via native as_of_window / as_of to trade_date.
+    4. Omitted ticker binds from cell state, and clamped dates verify cleanly against producer.
+    5. Unclamped past date mismatches fail verification.
+    """
+    from typing import TypedDict
+
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.prebuilt import ToolNode
+
+    from tradingagents.agents import tools as native_tools
+
+    class _State(TypedDict):
+        messages: Annotated[list[AnyMessage], add_messages]
+        trade_date: str
+        company_of_interest: str
+
+    trade_date = "2026-08-03"
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+
+    # 1. Arm A Yahoo ToolNode execution with future date clamping
+    cell_a = tmp_path / "round4-high1-a"
+    cell_a.mkdir(parents=True)
+    ctx_a = ProspectiveCaptureContext(cell_a, "NVDA", trade_date, "A", "att-r4-a")
+
+    raw_yahoo = {
+        "title": "NVDA AI Growth",
+        "summary": "Revenue surged",
+        "publisher": "Yahoo",
+        "link": "https://example.invalid/nvda",
+        "providerPublishTime": int(datetime(2026, 8, 3, 12, tzinfo=UTC).timestamp()),
+    }
+    yahoo_news._extract_article_data(raw_yahoo)
+
+    g_a = StateGraph(_State)
+    g_a.add_node("tools", ToolNode([native_tools.get_news]))
+    g_a.add_edge(START, "tools")
+    g_a.add_edge("tools", END)
+    app_a = g_a.compile()
+    cb_a = AuditCallbackHandler()
+
+    class MockClock(datetime):
+        instant = datetime(2026, 8, 3, 14, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            return cls.instant if tz else cls.instant.replace(tzinfo=None)
+
+    with (
+        patch.object(r, "datetime", MockClock),
+        patch.object(yahoo_news, "yf_retry", return_value=[raw_yahoo]),
+        ctx_a,
+    ):
+        res_a = app_a.invoke(
+            {
+                # Model emits future end_date: 2026-08-10, and omits ticker (injected from state)
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "get_news",
+                                "args": {"start_date": "2026-08-01", "end_date": "2026-08-10"},
+                                "id": "call-a-1",
+                            }
+                        ],
+                    )
+                ],
+                "trade_date": trade_date,
+                "company_of_interest": "NVDA",
+            },
+            config={"callbacks": [cb_a]},
+        )
+
+    # Verify cb_a traces:
+    assert len(cb_a.traces) == 2
+    assert cb_a.traces[0]["type"] == "tool_start"
+    # input is Python mapping string without ticker
+    assert "start_date" in cb_a.traces[0]["input"]
+    assert "ticker" not in cb_a.traces[0]["input"]
+    assert cb_a.traces[1]["type"] == "tool_end"
+    # output is raw string, not ToolMessage repr!
+    assert isinstance(cb_a.traces[1]["output"], str)
+    assert not cb_a.traces[1]["output"].startswith("ToolMessage(")
+    assert (
+        cb_a.traces[1]["output_hash"]
+        == hashlib.sha256(cb_a.traces[1]["output"].encode("utf-8")).hexdigest()
+    )
+
+    # ToolNode wrapped message in res_a is a ToolMessage
+    tool_msg = res_a["messages"][-1]
+    assert isinstance(tool_msg, ToolMessage)
+    assert tool_msg.content == cb_a.traces[1]["output"]
+
+    # Write audit trace for cell_a
+    res_dir_a = cell_a / "results"
+    res_dir_a.mkdir(parents=True, exist_ok=True)
+    (res_dir_a / "audit_trace.json").write_text(
+        json.dumps({"traces": cb_a.traces}), encoding="utf-8"
+    )
+
+    # validate_evidence_archive must pass: omitted ticker binds from cell state, future date clamps cleanly!
+    ok_a, msg_a = validate_evidence_archive(
+        ctx_a.archive_path, "A", "NVDA", trade_date, cutoff_dt, {"attempt_id": "att-r4-a"}, cell_a
+    )
+    assert ok_a is True, f"Arm A ToolNode verification failed: {msg_a}"
+
+    # 2. Arm B News Intelligence get_global_news ToolNode execution with future date clamping
+    cell_b = tmp_path / "round4-high1-b"
+    cell_b.mkdir(parents=True)
+    ctx_b = ProspectiveCaptureContext(cell_b, "NVDA", trade_date, "B", "att-r4-b")
+
+    raw_event = {
+        "id": "glob-r4",
+        "publishedAt": "2026-08-02T10:00:00Z",
+        "receivedAt": "2026-08-02T11:00:00Z",
+        "enrichedAt": "2026-08-02T11:05:00Z",
+        "symbols": ["GLOBAL"],
+        "title": "Global economic report",
+        "summary": "Inflation normalized",
+        "source": "Repo1",
+        "url": "https://example.invalid/econ",
+    }
+
+    class MockTransportClient:
+        def _make_request(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
+            return {"events": [raw_event]}
+
+    g_b = StateGraph(_State)
+    g_b.add_node("tools", ToolNode([native_tools.get_global_news]))
+    g_b.add_edge(START, "tools")
+    g_b.add_edge("tools", END)
+    app_b = g_b.compile()
+    cb_b = AuditCallbackHandler()
+
+    cfg_b = {
+        "tool_vendors": {
+            "get_global_news": "news_intelligence",
+            "get_news": "news_intelligence",
+        },
+        "data_vendors": {"news_data": "news_intelligence"},
+    }
+
+    with (
+        patch.object(r, "datetime", MockClock),
+        patch("tradingagents.dataflows.router.get_config", return_value=cfg_b),
+        patch.object(
+            ni_client.NewsIntelligenceClient, "_make_request", MockTransportClient._make_request
+        ),
+        ctx_b,
+    ):
+        app_b.invoke(
+            {
+                # Model calls get_global_news with future curr_date: 2026-08-15
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "get_global_news",
+                                "args": {
+                                    "curr_date": "2026-08-15",
+                                    "look_back_days": 3,
+                                    "limit": 5,
+                                },
+                                "id": "call-b-1",
+                            }
+                        ],
+                    )
+                ],
+                "trade_date": trade_date,
+                "company_of_interest": "NVDA",
+            },
+            config={"callbacks": [cb_b]},
+        )
+
+    assert len(cb_b.traces) == 2
+    assert cb_b.traces[0]["type"] == "tool_start"
+    assert cb_b.traces[1]["type"] == "tool_end"
+    assert isinstance(cb_b.traces[1]["output"], str)
+
+    res_dir_b = cell_b / "results"
+    res_dir_b.mkdir(parents=True, exist_ok=True)
+    (res_dir_b / "audit_trace.json").write_text(
+        json.dumps({"traces": cb_b.traces}), encoding="utf-8"
+    )
+
+    # validate_evidence_archive must pass: future curr_date clamped to trade_date
+    ok_b, msg_b = validate_evidence_archive(
+        ctx_b.archive_path, "B", "NVDA", trade_date, cutoff_dt, {"attempt_id": "att-r4-b"}, cell_b
+    )
+    assert ok_b is True, f"Arm B ToolNode verification failed: {msg_b}"
+
+    # 3. Negative control: past date mismatch cannot be explained by clamping and must fail
+    cb_bad = copy.deepcopy(cb_a.traces)
+    # Model asked for past date 2026-07-20 (not a future date clamped to 2026-08-01)
+    cb_bad[0]["input"] = "{'start_date': '2026-07-20', 'end_date': '2026-08-10'}"
+    (res_dir_a / "audit_trace.json").write_text(json.dumps({"traces": cb_bad}), encoding="utf-8")
+    ok_bad, msg_bad = validate_evidence_archive(
+        ctx_a.archive_path, "A", "NVDA", trade_date, cutoff_dt, {"attempt_id": "att-r4-a"}, cell_a
+    )
+    assert ok_bad is False
+    assert "start_date" in msg_bad and "does not match" in msg_bad
+
+
+def test_prosp_round4_high2_required_arguments_and_transport_contradiction_rejection(
+    tmp_path: Path,
+) -> None:
+    """Proves Round 4 Finding HIGH2:
+    1. Asset requests missing required model arguments (start_date/end_date for get_news, curr_date for get_global_news) fail closed.
+    2. Conflicting transport parameters (asOf, from, to, limit, symbol) fail closed.
+    3. Genuine optional defaults succeed cleanly.
+    """
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+    cell = tmp_path / "round4-high2"
+    cell.mkdir(parents=True)
+
+    raw_yahoo = {
+        "title": "NVDA AI Growth",
+        "summary": "Revenue surged",
+        "publisher": "Yahoo",
+        "link": "https://example.invalid/nvda",
+        "providerPublishTime": int(datetime(2026, 8, 3, 12, tzinfo=UTC).timestamp()),
+    }
+    extracted_yahoo = yahoo_news._extract_article_data(raw_yahoo)
+    formatted_yahoo = (
+        "## NVDA News, from 2026-08-01 to 2026-08-03:\n\n"
+        + yahoo_news._format_articles([extracted_yahoo])
+    )
+    out_hash = hashlib.sha256(formatted_yahoo.encode("utf-8")).hexdigest()
+
+    ctx = ProspectiveCaptureContext(cell, "NVDA", "2026-08-03", "A", "att-r4-h2")
+    ctx.commit_call(
+        "get_news",
+        "NVDA",
+        {"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"},
+        [raw_yahoo],
+        [extracted_yahoo],
+        formatted_yahoo,
+        "run-h2",
+        "2026-08-03T14:00:00Z",
+        producer_params={"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"},
+    )
+    res_dir = cell / "results"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = res_dir / "audit_trace.json"
+
+    # 1. Missing required start_date in get_news -> FAIL
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": "{'ticker': 'NVDA', 'end_date': '2026-08-03'}",
+                        "run_id": "run-h2",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": formatted_yahoo,
+                        "output_hash": out_hash,
+                        "run_id": "run-h2",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_nostart, msg_nostart = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-r4-h2"}, cell
+    )
+    assert ok_nostart is False
+    assert "missing required start_date" in msg_nostart
+
+    # 2. Missing required end_date in get_news -> FAIL
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": "{'ticker': 'NVDA', 'start_date': '2026-08-01'}",
+                        "run_id": "run-h2",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": formatted_yahoo,
+                        "output_hash": out_hash,
+                        "run_id": "run-h2",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_noend, msg_noend = validate_evidence_archive(
+        ctx.archive_path, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-r4-h2"}, cell
+    )
+    assert ok_noend is False
+    assert "missing required end_date" in msg_noend
+
+    # 3. Missing required curr_date in get_global_news -> FAIL
+    cell_glob = tmp_path / "round4-high2-glob"
+    cell_glob.mkdir(parents=True)
+    ctx_glob = ProspectiveCaptureContext(cell_glob, "NVDA", "2026-08-03", "B", "att-r4-glob")
+    ctx_glob.commit_call(
+        "get_global_news",
+        "global",
+        {
+            "symbol": "GLOBAL",
+            "asOf": "2026-08-03T23:59:59.999999Z",
+            "to": "2026-08-03T23:59:59.999999Z",
+            "from": "2026-07-27T00:00:00Z",
+            "limit": 10,
+        },
+        {"events": []},
+        [],
+        "## Global Market News:\n",
+        "run-glob",
+        "2026-08-03T14:00:00Z",
+        producer_params={"as_of_date": "2026-08-03", "look_back_days": 7, "limit": 10},
+    )
+    res_glob = cell_glob / "results"
+    res_glob.mkdir(parents=True, exist_ok=True)
+    (res_glob / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_global_news",
+                        "input": "{'look_back_days': 7, 'limit': 10}",  # Missing curr_date!
+                        "run_id": "run-glob",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_global_news",
+                        "output": "## Global Market News:\n",
+                        "output_hash": hashlib.sha256(b"## Global Market News:\n").hexdigest(),
+                        "run_id": "run-glob",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_noglob, msg_noglob = validate_evidence_archive(
+        ctx_glob.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r4-glob"},
+        cell_glob,
+    )
+    assert ok_noglob is False
+    assert "missing required" in msg_noglob and "curr_date" in msg_noglob
+
+    # 4. Conflicting transport parameters:
+    # 4a. Transport symbol contradicts producer ticker
+    arch_data = json.loads(ctx.archive_path.read_text(encoding="utf-8"))
+    bad_arch_symbol = copy.deepcopy(arch_data)
+    bad_arch_symbol["calls"][0]["params"]["symbol"] = "MSFT"
+    (cell / "data" / "bad_symbol.json").write_text(json.dumps(bad_arch_symbol), encoding="utf-8")
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": (
+                            "{'ticker': 'NVDA', 'start_date': '2026-08-01', 'end_date':"
+                            " '2026-08-03'}"
+                        ),
+                        "run_id": "run-h2",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": formatted_yahoo,
+                        "output_hash": out_hash,
+                        "run_id": "run-h2",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_sym, msg_sym = validate_evidence_archive(
+        cell / "data" / "bad_symbol.json",
+        "A",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r4-h2"},
+        cell,
+    )
+    assert ok_sym is False
+    assert "symbol" in msg_sym and "contradicts" in msg_sym
+
+    # 4b. Transport 'to' date contradicts producer end_date
+    bad_arch_to = copy.deepcopy(arch_data)
+    bad_arch_to["calls"][0]["params"]["to"] = "2026-08-05"
+    (cell / "data" / "bad_to.json").write_text(json.dumps(bad_arch_to), encoding="utf-8")
+    ok_to, msg_to = validate_evidence_archive(
+        cell / "data" / "bad_to.json",
+        "A",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r4-h2"},
+        cell,
+    )
+    assert ok_to is False
+    assert "to" in msg_to and "contradicts" in msg_to
+
+    # 4c. Transport 'from' date contradicts producer start_date
+    bad_arch_from = copy.deepcopy(arch_data)
+    bad_arch_from["calls"][0]["params"]["from"] = "2026-07-20"
+    (cell / "data" / "bad_from.json").write_text(json.dumps(bad_arch_from), encoding="utf-8")
+    ok_from, msg_from = validate_evidence_archive(
+        cell / "data" / "bad_from.json",
+        "A",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r4-h2"},
+        cell,
+    )
+    assert ok_from is False
+    assert "from" in msg_from and "contradicts" in msg_from
+
+    # 4d. Transport 'limit' contradicts producer limit
+    arch_glob_data = json.loads(ctx_glob.archive_path.read_text(encoding="utf-8"))
+    bad_arch_lim = copy.deepcopy(arch_glob_data)
+    bad_arch_lim["calls"][0]["params"]["limit"] = 25  # Producer has 10
+    (cell_glob / "data" / "bad_limit.json").write_text(json.dumps(bad_arch_lim), encoding="utf-8")
+    (res_glob / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_global_news",
+                        "input": "{'curr_date': '2026-08-03', 'look_back_days': 7, 'limit': 10}",
+                        "run_id": "run-glob",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_global_news",
+                        "output": "## Global Market News:\n",
+                        "output_hash": hashlib.sha256(b"## Global Market News:\n").hexdigest(),
+                        "run_id": "run-glob",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_lim, msg_lim = validate_evidence_archive(
+        cell_glob / "data" / "bad_limit.json",
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r4-glob"},
+        cell_glob,
+    )
+    assert ok_lim is False
+    assert "limit" in msg_lim and "contradicts" in msg_lim
+
+    # 4e. Transport asOf contradicts producer as_of_date
+    bad_arch_asof = copy.deepcopy(arch_glob_data)
+    bad_arch_asof["calls"][0]["params"]["asOf"] = "2026-08-05T00:00:00Z"
+    (cell_glob / "data" / "bad_asof.json").write_text(json.dumps(bad_arch_asof), encoding="utf-8")
+    ok_asof, msg_asof = validate_evidence_archive(
+        cell_glob / "data" / "bad_asof.json",
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r4-glob"},
+        cell_glob,
+    )
+    assert ok_asof is False
+    assert "asOf" in msg_asof and "contradicts" in msg_asof
+
+
+def test_prosp_round4_med3_capped_max_plus_one_read_and_race_growth_rejection(
+    tmp_path: Path,
+) -> None:
+    """Proves Round 4 Finding MED3:
+    1. _read_bounded_bytes caps read length at max_bytes + 1 before parsing, bounding memory.
+    2. Over-limit files are rejected with clean error without allocating unbounded memory.
+    3. Race growth / file replacement after initial stat is caught and rejected by bounded read.
+    4. Snapshot reading in _verify_v2_archive strictly enforces MAX_SNAPSHOT_BYTES.
+    """
+    test_dir = tmp_path / "round4-med3"
+    test_dir.mkdir(parents=True)
+
+    # 1. Direct unit verification of _read_bounded_bytes
+    small_file = test_dir / "small.txt"
+    small_file.write_bytes(b"hello world")
+    data, err = r._read_bounded_bytes(small_file, 20)
+    assert err is None
+    assert data == b"hello world"
+
+    # Exactly at limit:
+    data_exact, err_exact = r._read_bounded_bytes(small_file, 11)
+    assert err_exact is None
+    assert data_exact == b"hello world"
+
+    # Exceeding limit:
+    data_over, err_over = r._read_bounded_bytes(small_file, 10)
+    assert data_over is None
+    assert "exceeds maximum limit 10 bytes" in str(err_over)
+
+    # Bounded read verification: prove f.read was invoked with at most max_bytes + 1
+    read_lengths: list[int] = []
+    real_path_open = Path.open
+
+    class TrackingFile:
+        def __init__(self, f_obj: Any):
+            self._f = f_obj
+
+        def read(self, n: int = -1) -> bytes:
+            read_lengths.append(n)
+            return self._f.read(n)
+
+        def __enter__(self) -> TrackingFile:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            self._f.close()
+
+    def fake_path_open(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        f = real_path_open(self, mode, *args, **kwargs)
+        return TrackingFile(f)
+
+    bounded_dummy = test_dir / "bounded.bin"
+    bounded_dummy.write_bytes(b"A" * 30)
+    with patch.object(Path, "open", fake_path_open):
+        r._read_bounded_bytes(bounded_dummy, 50)
+
+    assert len(read_lengths) == 1
+    assert read_lengths[0] == 51  # max_bytes + 1 = 51! Never reads unbounded stream!
+
+    # 2. Race growth / replacement protection in _read_bounded_json_envelope
+    env_file = test_dir / "envelope.json"
+    env_file.write_text(json.dumps({"valid": "small"}), encoding="utf-8")
+
+    # Simulate race: stat() reports small file, but during open/read it has grown past MAX_ENVELOPE_BYTES
+    orig_stat = Path.stat
+
+    def fake_stat(p: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        # If inspecting env_file, return tiny size 100 bytes
+        if p == env_file:
+            return orig_stat(small_file)
+        return orig_stat(p, *args, **kwargs)
+
+    # Grow env_file beyond MAX_ENVELOPE_BYTES
+    env_file.write_bytes(b"{" + b'"k": "v",' * (r.MAX_ENVELOPE_BYTES // 5) + b'"end": 1}')
+    assert env_file.stat().st_size > r.MAX_ENVELOPE_BYTES
+
+    with patch.object(Path, "stat", fake_stat):
+        # Even though stat() claimed 11 bytes, _read_bounded_json_envelope caps read at MAX_ENVELOPE_BYTES + 1
+        # and rejects the grown file!
+        data_race, err_race = r._read_bounded_json_envelope(env_file)
+        assert data_race is None
+        assert f"exceeds maximum limit {r.MAX_ENVELOPE_BYTES} bytes" in str(err_race)
+
+    # 3. Snapshot bounded read in validate_evidence_archive
+    cell_snap = test_dir / "cell_snap"
+    cell_snap.mkdir(parents=True)
+    (cell_snap / "data").mkdir()
+    (cell_snap / "results").mkdir()
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+
+    # Snapshot exceeding MAX_SNAPSHOT_BYTES (10 MiB)
+    oversized_snap = cell_snap / "data" / "oversized_snap.json"
+    # Write oversized file
+    oversized_snap.write_bytes(b"[" + b"0," * (r.MAX_SNAPSHOT_BYTES // 2) + b"0]")
+    assert oversized_snap.stat().st_size > r.MAX_SNAPSHOT_BYTES
+    snap_hash = hashlib.sha256(oversized_snap.read_bytes()).hexdigest()
+
+    arch_snap = {
+        "version": "t13-archive/v2",
+        "attempt_id": "att-snap",
+        "ticker": "NVDA",
+        "arm": "A",
+        "date": "2026-08-03",
+        "cutoff": "2026-08-03T20:00:00Z",
+        "vendor": "yfinance",
+        "calls": [
+            {
+                "tool": "get_news",
+                "query": "NVDA",
+                "run_id": "run-snap",
+                "snapshot_path": "oversized_snap.json",
+                "raw_payload_hash": snap_hash,
+                "received_at": "2026-08-03T14:00:00Z",
+                "params": {"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"},
+                "producer_params": {
+                    "ticker": "NVDA",
+                    "start_date": "2026-08-01",
+                    "end_date": "2026-08-03",
+                },
+                "records": [],
+                "output_hash": hashlib.sha256(b"out").hexdigest(),
+            }
+        ],
+    }
+    arch_snap_file = cell_snap / "data" / "provenance_archive.json"
+    arch_snap_file.write_text(json.dumps(arch_snap), encoding="utf-8")
+
+    (cell_snap / "results" / "audit_trace.json").write_text(
+        json.dumps(
+            {
+                "traces": [
+                    {
+                        "type": "tool_start",
+                        "tool": "get_news",
+                        "input": "{'start_date': '2026-08-01', 'end_date': '2026-08-03'}",
+                        "run_id": "run-snap",
+                    },
+                    {
+                        "type": "tool_end",
+                        "tool": "get_news",
+                        "output": "out",
+                        "output_hash": hashlib.sha256(b"out").hexdigest(),
+                        "run_id": "run-snap",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ok_snap, msg_snap = validate_evidence_archive(
+        arch_snap_file, "A", "NVDA", "2026-08-03", cutoff_dt, {"attempt_id": "att-snap"}, cell_snap
+    )
+    assert ok_snap is False
+    assert f"exceeds maximum limit {r.MAX_SNAPSHOT_BYTES} bytes" in msg_snap
+
+
+def test_prosp_round5_transport_clock_exact_instant_verification_and_same_date_mutation_rejection(
+    tmp_path: Path,
+) -> None:
+    """Proves Round 5 (R4 Finding 1):
+    1. Derives full expected transport instants with native to_iso_utc contract:
+       - start-of-day for 'from' (YYYY-MM-DDT00:00:00Z)
+       - end-of-day for 'to' and 'asOf' (YYYY-MM-DDT23:59:59.999999Z)
+    2. Compares complete timestamps as UTC instants, rejecting invalid, malformed, or missing clocks.
+    3. Retains actual native producer/capture positive controls for both asset and global news.
+    4. Independently mutates only the time in asOf, to, and from on the same date and verifies rejection.
+    5. Rejects same-prefix malformed timestamps ('2026-08-03-not-a-timestamp').
+    6. Confirms legitimate UTC-equivalent representations ('+00:00') verify cleanly.
+    """
+    cutoff_dt = datetime(2026, 8, 3, 20, tzinfo=UTC)
+
+    class MockClock(datetime):
+        instant = datetime(2026, 8, 3, 14, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            return cls.instant if tz else cls.instant.replace(tzinfo=None)
+
+    raw_asset_event = {
+        "id": "asset-r5-ev",
+        "publishedAt": "2026-08-02T10:00:00Z",
+        "receivedAt": "2026-08-02T11:00:00Z",
+        "enrichedAt": "2026-08-02T11:05:00Z",
+        "symbols": ["NVDA"],
+        "title": "NVDA quarterly report",
+        "summary": "Revenue grew substantially",
+        "source": "Repo1",
+        "url": "https://example.invalid/nvda",
+    }
+    raw_global_event = {
+        "id": "glob-r5-ev",
+        "publishedAt": "2026-08-02T10:00:00Z",
+        "receivedAt": "2026-08-02T11:00:00Z",
+        "enrichedAt": "2026-08-02T11:05:00Z",
+        "symbols": ["GLOBAL"],
+        "title": "Global economic report",
+        "summary": "Inflation normalized",
+        "source": "Repo1",
+        "url": "https://example.invalid/econ",
+    }
+
+    class MockTransportClient:
+        def __init__(self, ev: dict[str, Any]) -> None:
+            self.ev = ev
+
+        def _make_request(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            return {"events": [self.ev]}
+
+    cfg_b = {
+        "tool_vendors": {
+            "get_global_news": "news_intelligence",
+            "get_news": "news_intelligence",
+        },
+        "data_vendors": {"news_data": "news_intelligence"},
+    }
+
+    # ------------------------------------------------------------------
+    # Part 1: Asset News (get_news, Arm B)
+    # ------------------------------------------------------------------
+    cell_asset = tmp_path / "r5-asset"
+    cell_asset.mkdir(parents=True)
+    cb_asset = AuditCallbackHandler()
+    ctx_asset = ProspectiveCaptureContext(cell_asset, "NVDA", "2026-08-03", "B", "att-r5-asset")
+    transport_asset = MockTransportClient(raw_asset_event)
+
+    with (
+        patch.object(r, "datetime", MockClock),
+        patch("tradingagents.dataflows.router.get_config", return_value=cfg_b),
+        patch.object(
+            ni_client.NewsIntelligenceClient, "_make_request", transport_asset._make_request
+        ),
+        ctx_asset,
+    ):
+        native_tools.get_news.invoke(
+            {"ticker": "NVDA", "start_date": "2026-08-01", "end_date": "2026-08-03"},
+            config={"callbacks": [cb_asset]},
+        )
+
+    res_asset = cell_asset / "results"
+    res_asset.mkdir(parents=True, exist_ok=True)
+    (res_asset / "audit_trace.json").write_text(
+        json.dumps({"traces": cb_asset.traces}), encoding="utf-8"
+    )
+
+    # 1a. Positive control: genuine native producer/capture verifies cleanly
+    ok_asset, msg_asset = validate_evidence_archive(
+        ctx_asset.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-asset"},
+        cell_asset,
+    )
+    assert ok_asset is True, f"Native Arm B asset positive control failed: {msg_asset}"
+
+    # 1b. Legitimate UTC-equivalent timestamp representation (+00:00) verifies cleanly
+    base_asset_data = json.loads(ctx_asset.archive_path.read_text(encoding="utf-8"))
+    equiv_asset_data = copy.deepcopy(base_asset_data)
+    equiv_asset_data["calls"][0]["params"]["asOf"] = "2026-08-03T23:59:59.999999+00:00"
+    (cell_asset / "data" / "provenance_archive.json").write_text(
+        json.dumps(equiv_asset_data), encoding="utf-8"
+    )
+    ok_equiv_a, msg_equiv_a = validate_evidence_archive(
+        ctx_asset.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-asset"},
+        cell_asset,
+    )
+    assert ok_equiv_a is True, f"Asset UTC-equivalent representation failed: {msg_equiv_a}"
+
+    # 1c. Mutation 1: Same-date time mutation in asOf (23:59:59.999999Z -> 10:00:00Z) fails
+    mut_asof_a = copy.deepcopy(base_asset_data)
+    mut_asof_a["calls"][0]["params"]["asOf"] = "2026-08-03T10:00:00Z"
+    (cell_asset / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_asof_a), encoding="utf-8"
+    )
+    ok_mut_asof_a, msg_mut_asof_a = validate_evidence_archive(
+        ctx_asset.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-asset"},
+        cell_asset,
+    )
+    assert ok_mut_asof_a is False
+    assert "asOf" in msg_mut_asof_a and "contradicts" in msg_mut_asof_a
+
+    # 1d. Mutation 2: Same-date time mutation in to (23:59:59.999999Z -> 10:00:00Z) fails
+    mut_to_a = copy.deepcopy(base_asset_data)
+    mut_to_a["calls"][0]["params"]["to"] = "2026-08-03T10:00:00Z"
+    (cell_asset / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_to_a), encoding="utf-8"
+    )
+    ok_mut_to_a, msg_mut_to_a = validate_evidence_archive(
+        ctx_asset.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-asset"},
+        cell_asset,
+    )
+    assert ok_mut_to_a is False
+    assert "to" in msg_mut_to_a and "contradicts" in msg_mut_to_a
+
+    # 1e. Mutation 3: Same-date time mutation in from (00:00:00Z -> 23:00:00Z) fails
+    mut_from_a = copy.deepcopy(base_asset_data)
+    mut_from_a["calls"][0]["params"]["from"] = "2026-08-01T23:00:00Z"
+    (cell_asset / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_from_a), encoding="utf-8"
+    )
+    ok_mut_from_a, msg_mut_from_a = validate_evidence_archive(
+        ctx_asset.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-asset"},
+        cell_asset,
+    )
+    assert ok_mut_from_a is False
+    assert "from" in msg_mut_from_a and "contradicts" in msg_mut_from_a
+
+    # 1f. Mutation 4: Invalid same-prefix timestamp in asOf ('2026-08-03-not-a-timestamp') fails
+    mut_bad_a = copy.deepcopy(base_asset_data)
+    mut_bad_a["calls"][0]["params"]["asOf"] = "2026-08-03-not-a-timestamp"
+    (cell_asset / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_bad_a), encoding="utf-8"
+    )
+    ok_mut_bad_a, msg_mut_bad_a = validate_evidence_archive(
+        ctx_asset.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-asset"},
+        cell_asset,
+    )
+    assert ok_mut_bad_a is False
+    assert "asOf" in msg_mut_bad_a and "contradicts" in msg_mut_bad_a
+
+    # 1g. Deletion 1: Missing required transport parameter 'asOf' in asset news fails
+    mut_del_asof_a = copy.deepcopy(base_asset_data)
+    del mut_del_asof_a["calls"][0]["params"]["asOf"]
+    (cell_asset / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_del_asof_a), encoding="utf-8"
+    )
+    ok_del_asof_a, msg_del_asof_a = validate_evidence_archive(
+        ctx_asset.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-asset"},
+        cell_asset,
+    )
+    assert ok_del_asof_a is False
+    assert "missing required parameter 'asOf'" in msg_del_asof_a
+
+    # 1h. Deletion 2: Missing required transport parameter 'to' in asset news fails
+    mut_del_to_a = copy.deepcopy(base_asset_data)
+    del mut_del_to_a["calls"][0]["params"]["to"]
+    (cell_asset / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_del_to_a), encoding="utf-8"
+    )
+    ok_del_to_a, msg_del_to_a = validate_evidence_archive(
+        ctx_asset.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-asset"},
+        cell_asset,
+    )
+    assert ok_del_to_a is False
+    assert "missing required parameter 'to'" in msg_del_to_a
+
+    # 1i. Deletion 3: Missing required transport parameter 'from' in asset news fails
+    mut_del_from_a = copy.deepcopy(base_asset_data)
+    del mut_del_from_a["calls"][0]["params"]["from"]
+    (cell_asset / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_del_from_a), encoding="utf-8"
+    )
+    ok_del_from_a, msg_del_from_a = validate_evidence_archive(
+        ctx_asset.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-asset"},
+        cell_asset,
+    )
+    assert ok_del_from_a is False
+    assert "missing required parameter 'from'" in msg_del_from_a
+
+    # Restore valid asset archive
+    (cell_asset / "data" / "provenance_archive.json").write_text(
+        json.dumps(base_asset_data), encoding="utf-8"
+    )
+
+    # ------------------------------------------------------------------
+    # Part 2: Global News (get_global_news, Arm B)
+    # ------------------------------------------------------------------
+    cell_glob = tmp_path / "r5-glob"
+    cell_glob.mkdir(parents=True)
+    cb_glob = AuditCallbackHandler()
+    ctx_glob = ProspectiveCaptureContext(cell_glob, "NVDA", "2026-08-03", "B", "att-r5-glob")
+    transport_glob = MockTransportClient(raw_global_event)
+
+    with (
+        patch.object(r, "datetime", MockClock),
+        patch("tradingagents.dataflows.router.get_config", return_value=cfg_b),
+        patch.object(
+            ni_client.NewsIntelligenceClient, "_make_request", transport_glob._make_request
+        ),
+        ctx_glob,
+    ):
+        native_tools.get_global_news.invoke(
+            {"curr_date": "2026-08-03", "look_back_days": 7, "limit": 10},
+            config={"callbacks": [cb_glob]},
+        )
+
+    res_glob = cell_glob / "results"
+    res_glob.mkdir(parents=True, exist_ok=True)
+    (res_glob / "audit_trace.json").write_text(
+        json.dumps({"traces": cb_glob.traces}), encoding="utf-8"
+    )
+
+    # 2a. Positive control: genuine native producer/capture verifies cleanly
+    ok_glob, msg_glob = validate_evidence_archive(
+        ctx_glob.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-glob"},
+        cell_glob,
+    )
+    assert ok_glob is True, f"Native Arm B global positive control failed: {msg_glob}"
+
+    # 2b. Legitimate UTC-equivalent timestamp representation (+00:00) verifies cleanly
+    base_glob_data = json.loads(ctx_glob.archive_path.read_text(encoding="utf-8"))
+    equiv_glob_data = copy.deepcopy(base_glob_data)
+    equiv_glob_data["calls"][0]["params"]["asOf"] = "2026-08-03T23:59:59.999999+00:00"
+    (cell_glob / "data" / "provenance_archive.json").write_text(
+        json.dumps(equiv_glob_data), encoding="utf-8"
+    )
+    ok_equiv_g, msg_equiv_g = validate_evidence_archive(
+        ctx_glob.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-glob"},
+        cell_glob,
+    )
+    assert ok_equiv_g is True, f"Global UTC-equivalent representation failed: {msg_equiv_g}"
+
+    # 2c. Mutation 1: Same-date time mutation in asOf (23:59:59.999999Z -> 10:00:00Z) fails
+    mut_asof_g = copy.deepcopy(base_glob_data)
+    mut_asof_g["calls"][0]["params"]["asOf"] = "2026-08-03T10:00:00Z"
+    (cell_glob / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_asof_g), encoding="utf-8"
+    )
+    ok_mut_asof_g, msg_mut_asof_g = validate_evidence_archive(
+        ctx_glob.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-glob"},
+        cell_glob,
+    )
+    assert ok_mut_asof_g is False
+    assert "asOf" in msg_mut_asof_g and "contradicts" in msg_mut_asof_g
+
+    # 2d. Mutation 2: Same-date time mutation in to (23:59:59.999999Z -> 10:00:00Z) fails
+    mut_to_g = copy.deepcopy(base_glob_data)
+    mut_to_g["calls"][0]["params"]["to"] = "2026-08-03T10:00:00Z"
+    (cell_glob / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_to_g), encoding="utf-8"
+    )
+    ok_mut_to_g, msg_mut_to_g = validate_evidence_archive(
+        ctx_glob.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-glob"},
+        cell_glob,
+    )
+    assert ok_mut_to_g is False
+    assert "to" in msg_mut_to_g and "contradicts" in msg_mut_to_g
+
+    # 2e. Mutation 3: Same-date time mutation in from (00:00:00Z -> 23:00:00Z) fails
+    mut_from_g = copy.deepcopy(base_glob_data)
+    mut_from_g["calls"][0]["params"]["from"] = "2026-07-27T23:00:00Z"
+    (cell_glob / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_from_g), encoding="utf-8"
+    )
+    ok_mut_from_g, msg_mut_from_g = validate_evidence_archive(
+        ctx_glob.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-glob"},
+        cell_glob,
+    )
+    assert ok_mut_from_g is False
+    assert "from" in msg_mut_from_g and "contradicts" in msg_mut_from_g
+
+    # 2f. Mutation 4: Invalid same-prefix timestamp in asOf ('2026-08-03-not-a-timestamp') fails
+    mut_bad_g = copy.deepcopy(base_glob_data)
+    mut_bad_g["calls"][0]["params"]["asOf"] = "2026-08-03-not-a-timestamp"
+    (cell_glob / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_bad_g), encoding="utf-8"
+    )
+    ok_mut_bad_g, msg_mut_bad_g = validate_evidence_archive(
+        ctx_glob.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-glob"},
+        cell_glob,
+    )
+    assert ok_mut_bad_g is False
+    assert "asOf" in msg_mut_bad_g and "contradicts" in msg_mut_bad_g
+
+    # 2g. Deletion 1: Missing required transport parameter 'asOf' in global news fails
+    mut_del_asof_g = copy.deepcopy(base_glob_data)
+    del mut_del_asof_g["calls"][0]["params"]["asOf"]
+    (cell_glob / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_del_asof_g), encoding="utf-8"
+    )
+    ok_del_asof_g, msg_del_asof_g = validate_evidence_archive(
+        ctx_glob.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-glob"},
+        cell_glob,
+    )
+    assert ok_del_asof_g is False
+    assert "missing required parameter 'asOf'" in msg_del_asof_g
+
+    # 2h. Deletion 2: Missing required transport parameter 'to' in global news fails
+    mut_del_to_g = copy.deepcopy(base_glob_data)
+    del mut_del_to_g["calls"][0]["params"]["to"]
+    (cell_glob / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_del_to_g), encoding="utf-8"
+    )
+    ok_del_to_g, msg_del_to_g = validate_evidence_archive(
+        ctx_glob.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-glob"},
+        cell_glob,
+    )
+    assert ok_del_to_g is False
+    assert "missing required parameter 'to'" in msg_del_to_g
+
+    # 2i. Deletion 3: Missing required transport parameter 'from' in global news fails
+    mut_del_from_g = copy.deepcopy(base_glob_data)
+    del mut_del_from_g["calls"][0]["params"]["from"]
+    (cell_glob / "data" / "provenance_archive.json").write_text(
+        json.dumps(mut_del_from_g), encoding="utf-8"
+    )
+    ok_del_from_g, msg_del_from_g = validate_evidence_archive(
+        ctx_glob.archive_path,
+        "B",
+        "NVDA",
+        "2026-08-03",
+        cutoff_dt,
+        {"attempt_id": "att-r5-glob"},
+        cell_glob,
+    )
+    assert ok_del_from_g is False
+    assert "missing required parameter 'from'" in msg_del_from_g
