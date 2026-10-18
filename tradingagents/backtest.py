@@ -147,7 +147,8 @@ def run_backtest(
     """
     # run_id becomes a path segment, so it is validated like a ticker: an
     # absolute or dotted value would otherwise place the run outside results_dir.
-    run_id = safe_ticker_component(run_id or datetime.now().strftime("%Y%m%d_%H%M%S"))
+    # Service job UUIDs use 36 characters; asset/ticker limits remain unchanged.
+    run_id = safe_ticker_component(run_id or datetime.now().strftime("%Y%m%d_%H%M%S"), max_len=36)
     run_dir = Path(config["results_dir"]) / "backtest" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     run_config = {**config, "results_dir": str(run_dir),

@@ -154,12 +154,39 @@ def test_the_analyst_set_under_test_is_the_one_that_runs(tmp_path):
 
 
 @pytest.mark.unit
-def test_a_run_id_cannot_escape_the_results_directory(tmp_path):
+@pytest.mark.parametrize("run_id", [
+    "../../escaped", "..\\escaped", "/etc/cron.d/x", "C:\\escaped",
+    ".", "..", "...", "bad\x00id", "a" * 37,
+])
+def test_a_run_id_cannot_escape_the_results_directory(tmp_path, run_id):
     """run_id becomes a path segment, so it is validated like a ticker is."""
     with pytest.raises(ValueError):
-        run_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path), run_id="../../escaped")
-    with pytest.raises(ValueError):
-        run_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path), run_id="/etc/cron.d/x")
+        run_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path), run_id=run_id)
+
+
+@pytest.mark.unit
+def test_service_uuid_reaches_native_backtest_without_changing_identity(tmp_path):
+    from tradingagents.service import worker
+    from tradingagents.service.store import RunStore
+
+    store = RunStore(tmp_path / "runs.db")
+    request = {
+        "tickers": ["NVDA"], "startDate": "2026-01-05", "endDate": "2026-01-05",
+        "everyNDays": 7, "assetType": "stock", "selectedAnalysts": ["market"],
+    }
+    created = store.create("backtest", request, 2)
+    run_id = created["backtestId"]
+    assert len(run_id) == 36
+    store.claim_next()
+
+    worker.run_job(store, run_id, {"llm_provider": "ollama"})
+
+    result = store.get(run_id)
+    assert result["backtestId"] == run_id
+    assert result["status"] == "completed" and result["cellsRun"] == 1
+    log_path = tmp_path / "runs" / run_id / "results" / "backtest" / run_id / "trading_memory.md"
+    assert _FakeGraph.instances[-1].config["memory_log_path"] == str(log_path)
+    assert log_path.is_file()
 
 
 @pytest.mark.unit
